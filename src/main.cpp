@@ -90,6 +90,7 @@ static void bootTo(int target) {
   rend.flush();
   while (bootShown < target) {
     uint32_t n = millis();
+    ui::bootAnimTick(n);
     bootShown += BOOT_BAR_RATE * (n - t) * 1e-3f;
     t = n;
     if (bootShown > target) bootShown = (float)target;
@@ -97,6 +98,11 @@ static void bootTo(int target) {
     rend.flush();
     delay(15);
   }
+}
+
+// Let the boot animation play out to its last frame (it is time-based, so init work that blocked loop() only skips frames).
+static void bootAnimWait() {
+  while (!ui::bootAnimDone()) { ui::bootAnimTick(millis()); rend.flush(); delay(5); }
 }
 
 void setup() {
@@ -126,6 +132,7 @@ void setup() {
   ble.begin(&model);                       bootTo(90);
 
   ui::bootLabel("Ready");                  bootTo(100);
+  bootAnimWait();
   delay(300);
 
   screen = ui::SCR_IDLE;                   // boot screen -> idle screen

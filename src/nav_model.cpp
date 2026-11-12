@@ -11,7 +11,7 @@ inline int64_t d2(const Pt& p, int32_t x, int32_t y) {
 
 void NavModel::resetSession() {
   ringA.clear(); ringB.clear(); active = &ringA; shadow = &ringB;
-  navState = proto::NAV_IDLE; icon = 0; street[0] = 0; distToTurn = 0xFFFF;
+  navState = proto::NAV_IDLE; icon = 0; street[0] = 0; distToTurn = 0xFFFF; speedLimitKmh = 0;
   cursor = 0; pose.reset(); routeRev++;
 }
 
@@ -48,4 +48,28 @@ void NavModel::update(float dt, uint32_t nowMs) {
     else break;
   }
   r.trimBefore(cursor > KEEP_BEHIND ? cursor - KEEP_BEHIND : 0);   // frees slots for the phone
+}
+bool NavModel::handleAt(const uint8_t* d, size_t n) {
+  if (n < 3 || d[0] != 'A' || d[1] != 'T' || d[2] != ':')
+    return false;
+
+  size_t i = 3;
+  size_t k = 0;
+
+  while (i < n && d[i] == ' ') i++;
+  if (i < n && d[i] == '"') i++;
+
+  constexpr size_t MAX_ALERT_LEN = sizeof(alertText) - 1;
+
+  for (; i < n && d[i] != '"' && d[i] != '\r' && d[i] != '\n'; i++) {
+    if (k >= MAX_ALERT_LEN) break;
+
+    uint8_t c = d[i];
+    alertText[k++] = (c >= 32 && c < 127) ? (char)c : '?';
+  }
+
+  alertText[k] = '\0';
+  alertRev++;
+
+  return true;
 }

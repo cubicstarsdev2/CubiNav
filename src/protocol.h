@@ -4,13 +4,16 @@
 
 #define PROTO_VERSION 1
 
+// POSE byte 16 (optional, appended in FW 1.2.0): posted speed limit in km/h, 0 = unknown (device keeps the previous one).
+#define SPEED_LIMIT_MAX_KMH 250
+
 // ---- Firmware version --------------------------------------------------------------------------------
 // >>> To release a new firmware, edit ONLY this string ("major.minor.patch") and put the same
 // >>> "## x.y.z" line at the top of README.md (the phone reads the README to decide whether to update).
 // No build script needed: the string is parsed at compile time. Limits: major 0-255, minor 0-15, patch 0-15.
 // Can still be overridden from the build flags:  -DFW_VERSION_STRING=\"1.2.3\"
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "1.1.0"
+#define FW_VERSION_STRING "1.2.1"
 #endif
 
 // Wire format (HELLO_ACK / OTA_BEGIN, u16): (major << 8) | (minor << 4) | patch.  1.0.0 == 0x0100.

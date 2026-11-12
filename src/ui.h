@@ -27,6 +27,8 @@ void initRest();                                  // all other sprites and icons
 void bootDraw();                                  // logo, title, empty bar
 void bootLabel(const char* s);
 void bootBar(int pct);                            // 0..100
+void bootAnimTick(uint32_t nowMs);                // advance the boot animation (needs boot_frames.h)
+bool bootAnimDone();                              // last frame shown (true when there is no animation)
 
 // ---- Runtime screens ----
 void enter(Screen s);                             // clears BASE; call on every screen change

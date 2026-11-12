@@ -180,6 +180,7 @@ void BleNav::sendAck(uint8_t id, uint8_t status, uint32_t expected, uint16_t fre
 void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
   NavModel& m = *m_;
   if (n < 1) return;
+  if (d[0] == 'A' && m.handleAt(d, n)) return;          // AT:"message" -> flashing panel ('A' is not a protocol id)
   switch (d[0]) {
     case HELLO:
       if (n < 2) { m.badMsgs++; break; }
@@ -199,6 +200,9 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
       if (n < 16) { m.badMsgs++; break; }
       m.pose.onPose(rdI32(d + 1), rdI32(d + 5), rdU16(d + 9), rdU16(d + 11), (d[15] & 1) != 0, now);
       m.distToTurn = rdU16(d + 13);
+      // Optional byte 16 (v1.2.0+): posted speed limit in km/h. 0 = unknown -> keep the previous one.
+      if (n >= 17 && d[16] != 0 && d[16] <= SPEED_LIMIT_MAX_KMH) m.speedLimitKmh = d[16];
+      Serial.printf("POSE n=%u lim=%u\n", (unsigned)n, n >= 17 ? d[16] : 0);
       break;
 
     case ROUTE_BEGIN:
@@ -230,7 +234,7 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
     case ROUTE_CLEAR:
       if (n < 2) { m.badMsgs++; break; }
       if (m.shadow->valid() && m.shadow->id() == d[1]) m.shadow->clear();
-      if (m.active->valid() && m.active->id() == d[1]) { m.active->clear(); m.routeRev++; }
+      if (m.active->valid() && m.active->id() == d[1]) { m.active->clear(); m.routeRev++; m.speedLimitKmh = 0; }
       break;
 
     case MANEUVER: {
@@ -261,6 +265,7 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
     case NAV_STATE:
       if (n < 2) { m.badMsgs++; break; }
       if (d[1] <= NAV_NO_GPS) m.navState = d[1];
+      if (d[1] == NAV_IDLE) m.speedLimitKmh = 0;           // trip over: do not carry the limit into the next one
       break;
 
     case OTA_BEGIN: case OTA_CHUNK: case OTA_END: case OTA_ABORT:

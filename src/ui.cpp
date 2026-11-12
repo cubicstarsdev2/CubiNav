@@ -6,8 +6,23 @@
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
+#include <stdlib.h>
 #include "config.h"
 #include "tv_fonts.h"
+
+// Optional boot animation: put boot_frames.h (from png2frames.py) next to the sources to enable it.
+#if defined(__has_include)
+  #if __has_include("boot_frames.h")
+    #include "boot_frames.h"
+    #define HAVE_BOOT_ANIM 1
+  #endif
+#endif
+#ifndef HAVE_BOOT_ANIM
+#define HAVE_BOOT_ANIM 0
+#endif
+#ifndef BOOT_ANIM_SCALE
+#define BOOT_ANIM_SCALE ((SCREEN_H - 32) / BOOT_FRAME_H)   // auto: largest integer scale with a 16 px margin (64 px -> x4, 128 px -> x2 = 256 px)
+#endif
 
 using namespace mtr;
 
@@ -802,6 +817,61 @@ void initBoot(TFT_eSPI* t, Renderer* r) {
   setText(tBootV, v, FB11, AL_C, 13, 2);
 }
 
+// ---- Boot animation (frames from boot_frames.h, made by png2frames.py) ---------------------------
+// 1-bpp transparent frames, nearest-neighbour upscaled by BOOT_ANIM_SCALE into a RAM buffer and drawn into BASE.
+// The renderer diffs against what the panel shows, so only the pixels that changed between frames go over SPI.
+#if HAVE_BOOT_ANIM
+namespace {
+constexpr int BA_S = BOOT_ANIM_SCALE;
+constexpr int BA_W = BOOT_FRAME_W * BA_S, BA_H = BOOT_FRAME_H * BA_S;
+constexpr int BA_STRIDE = BA_W / 8;
+constexpr int BA_X = (SCREEN_W - BA_W) / 2, BA_Y = (SCREEN_H - BA_H) / 2;   // centred: the animation IS the boot screen
+static_assert(BA_W % 8 == 0, "BOOT_FRAME_W * BOOT_ANIM_SCALE must be a multiple of 8");
+
+uint8_t* baBuf = nullptr;
+int      baShown = -1;
+uint32_t baNext = 0;     // when the next frame is due; 0 = clock not started yet
+
+void baDraw(int f) {
+  if (!baBuf) return;
+  const uint8_t* fr = BOOT_FRAMES[f];
+  const int sb = BOOT_FRAME_W / 8;
+  for (int y = 0; y < BOOT_FRAME_H; y++) {
+    uint8_t* row = baBuf + y * BA_S * BA_STRIDE;
+    memset(row, 0, BA_STRIDE);
+    for (int x = 0; x < BOOT_FRAME_W; x++)
+      if (fr[y * sb + (x >> 3)] & (0x80 >> (x & 7)))
+        for (int k = 0; k < BA_S; k++) { int bx = x * BA_S + k; row[bx >> 3] |= (uint8_t)(0x80 >> (bx & 7)); }
+    for (int r = 1; r < BA_S; r++) memcpy(row + r * BA_STRIDE, row, BA_STRIDE);
+  }
+  R->baseFillRect(BA_X, BA_Y, BA_W, BA_H, M_CLR);        // frames are transparent: clear, then SET
+  R->baseBitmap(BA_X, BA_Y, BA_W, BA_H, baBuf, M_SET);
+  baShown = f;
+}
+}  // namespace
+#endif
+
+void bootAnimTick(uint32_t now) {
+#if HAVE_BOOT_ANIM
+  if (baShown < 0 || baShown >= BOOT_FRAME_COUNT - 1) return;   // play once, hold the last frame
+  const uint32_t per = 1000 / BOOT_FRAME_FPS;
+  if (!baNext) { baNext = now ? now : 1; return; }              // frame 0 stays up until the first tick
+  if (now - baNext < per) return;
+  baDraw(baShown + 1);                                          // never skip a frame, even after a blocking init
+  baNext = (now - baNext >= 2 * per) ? now : baNext + per;      // after a stall resume at normal speed, no burst
+#else
+  (void)now;
+#endif
+}
+
+bool bootAnimDone() {
+#if HAVE_BOOT_ANIM
+  return baShown < 0 || baShown >= BOOT_FRAME_COUNT - 1;
+#else
+  return true;
+#endif
+}
+
 void initRest() {
   buildLogo(spLogoSmall, LOGO_SMALL);
   // idle
@@ -850,13 +920,23 @@ void initRest() {
 
 void bootDraw() {
   R->baseClear(M_CLR);
+#if HAVE_BOOT_ANIM
+  baBuf = (uint8_t*)malloc(BA_STRIDE * BA_H);                          // the animation replaces the whole loading screen
+  baNext = 0;                                                          // clock starts at the first tick, after the first flush
+  baDraw(0);
+  return;                                                              // no logo, title, version, label or bar
+#else
   R->baseBitmap(196, 52, LOGO_BIG, LOGO_BIG, ptr(spLogoBig), M_SET);
   R->baseBitmap(tBootT.x, tBootT.y, tBootT.w, tBootT.h, ptr(tBootT.sp), M_SET);
+#endif
   R->baseBitmap(tBootV.x, tBootV.y, tBootV.w, tBootV.h, ptr(tBootV.sp), M_SET);
   R->baseFillRect(BAR_X, BAR_Y + 2, BAR_W, 2, M_SET);                  // thin rule; the fill grows over it
 }
 
 void bootLabel(const char* s) {
+#if HAVE_BOOT_ANIM
+  (void)s; return;
+#endif
   char u[48]; size_t n = 0;
   for (; s[n] && n < sizeof(u) - 1; n++) u[n] = (s[n] >= 'a' && s[n] <= 'z') ? (char)(s[n] - 32) : s[n];
   u[n] = 0;
@@ -866,6 +946,9 @@ void bootLabel(const char* s) {
 }
 
 void bootBar(int pct) {
+#if HAVE_BOOT_ANIM
+  (void)pct; return;
+#endif
   if (pct > 100) pct = 100;
   int fw = BAR_W * pct / 100;
   if (fw > 0) R->baseFillRect(BAR_X, BAR_Y, fw, 6, M_SET);
