@@ -20,6 +20,12 @@
 #ifndef HAVE_BOOT_ANIM
 #define HAVE_BOOT_ANIM 0
 #endif
+#ifndef BOOT_FRAME_FORMAT
+#define BOOT_FRAME_FORMAT 0        // 0 = 1-bpp BOOT_FRAMES (png2frames.py), 1 = alpha4 RLE (png2frames.py --format alpha4)
+#endif
+#if HAVE_BOOT_ANIM && BOOT_FRAME_FORMAT == 1
+  #include "boot_alpha.h"
+#endif
 #ifndef BOOT_ANIM_SCALE
 #define BOOT_ANIM_SCALE ((SCREEN_H - 32) / BOOT_FRAME_H)   // auto: largest integer scale with a 16 px margin (64 px -> x4, 128 px -> x2 = 256 px)
 #endif
@@ -818,7 +824,8 @@ void initBoot(TFT_eSPI* t, Renderer* r) {
 }
 
 // ---- Boot animation (frames from boot_frames.h, made by png2frames.py) ---------------------------
-// 1-bpp transparent frames, nearest-neighbour upscaled by BOOT_ANIM_SCALE into a RAM buffer and drawn into BASE.
+// Format 0: 1-bpp transparent frames, nearest-neighbour upscaled by BOOT_ANIM_SCALE into a RAM buffer and drawn into BASE.
+// Format 1: 4-bit darkness RLE frames, upscaled and Bayer-dithered at output resolution (boot_alpha.h).
 // The renderer diffs against what the panel shows, so only the pixels that changed between frames go over SPI.
 #if HAVE_BOOT_ANIM
 namespace {
@@ -834,6 +841,9 @@ uint32_t baNext = 0;     // when the next frame is due; 0 = clock not started ye
 
 void baDraw(int f) {
   if (!baBuf) return;
+#if BOOT_FRAME_FORMAT == 1
+  bootalpha::decode(BOOT_ALPHA_DATA + pgm_read_dword(&BOOT_ALPHA_OFFSETS[f]), BOOT_FRAME_W, BOOT_FRAME_H, BA_S, baBuf);
+#else
   const uint8_t* fr = BOOT_FRAMES[f];
   const int sb = BOOT_FRAME_W / 8;
   for (int y = 0; y < BOOT_FRAME_H; y++) {
@@ -844,6 +854,7 @@ void baDraw(int f) {
         for (int k = 0; k < BA_S; k++) { int bx = x * BA_S + k; row[bx >> 3] |= (uint8_t)(0x80 >> (bx & 7)); }
     for (int r = 1; r < BA_S; r++) memcpy(row + r * BA_STRIDE, row, BA_STRIDE);
   }
+#endif
   R->baseFillRect(BA_X, BA_Y, BA_W, BA_H, M_CLR);        // frames are transparent: clear, then SET
   R->baseBitmap(BA_X, BA_Y, BA_W, BA_H, baBuf, M_SET);
   baShown = f;

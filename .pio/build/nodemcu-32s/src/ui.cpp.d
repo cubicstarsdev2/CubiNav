@@ -233,4 +233,4 @@
  .pio/libdeps/nodemcu-32s/TFT_eSPI/Extensions/Sprite.h \
  src/MonoTileRenderer.h src/nav_model.h src/route_ring.h src/protocol.h \
  src/pose_filter.h src/config.h src/ota.h src/tv_fonts.h \
- src/boot_frames.h
+ src/boot_frames.h src/boot_alpha.h
