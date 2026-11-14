@@ -135,6 +135,9 @@ void doAbort() {
 
 void setSender(SendFn fn) { sendFn = fn; }
 
+// main calls this every frame while it is holding the RX queue: the transfer is alive, just paused on our side.
+void keepAlive() { if (in.state == OTA_RECEIVING) lastRxMs_ = millis(); }
+
 bool onMessage(uint8_t type, const uint8_t* p, size_t len, bool secure) {
   switch (type) {
     case OTA_BEGIN: doBegin(p, len, secure); return true;

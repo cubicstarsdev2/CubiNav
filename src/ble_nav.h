@@ -15,6 +15,10 @@ class BleNav {
   bool pairing()   const { return pairing_; }       // passkey is being displayed
   uint32_t passkey() const { return passkey_; }
   void setBatteryLevel(uint8_t pct);         // standard Battery Service (0x180F)
+  // poll() stops draining the RX queue right after an OTA_BEGIN, so the update screen can build up without flash writes in
+  // between. main calls resumeRx() once the transition is over. Cleared on disconnect.
+  void resumeRx()        { rxPaused_ = false; }
+  bool rxPaused() const  { return rxPaused_; }
 
   // --- internal: called from NimBLE callbacks (other task) ---
   void _onConnect();
@@ -33,7 +37,7 @@ class BleNav {
 
   NavModel* m_ = nullptr;
   QueueHandle_t q_ = nullptr;
-  volatile bool connected_ = false, pairing_ = false, evtDisc_ = false;
+  volatile bool connected_ = false, pairing_ = false, evtDisc_ = false, rxPaused_ = false;
   volatile uint32_t passkey_ = 0;
   uint8_t  chunksSinceAck_ = 0;
   uint16_t lastFree_ = 0;

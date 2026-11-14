@@ -1,5 +1,5 @@
 /*
-  TahVia firmware - ESP32 + TFT_eSPI (ILI9488 480x320) + MonoTileRenderer + NimBLE
+  CubiNav firmware - ESP32 + TFT_eSPI (ILI9488 480x320) + MonoTileRenderer + NimBLE
 
   Flow
     setup():  boot screen (logo + loading bar)  ->  idle screen
@@ -137,7 +137,7 @@ void setup() {
 
   screen = ui::SCR_IDLE;                   // boot screen -> idle screen
   ui::enter(screen);
-  Serial.println("TahVia ready");
+  Serial.println("CubiNav ready");
 }
 
 // ---- Main loop ---------------------------------------------------------------------------------
@@ -173,6 +173,11 @@ void loop() {
   lastUs = nowUs;
   if (dt > 0.1f) dt = 0.1f;
 
+  // OTA timeouts, error screen timer, deferred reboot. BEFORE the screen decision: when the error screen times out the state
+  // goes back to IDLE here, and the screen must leave SCR_UPDATE in this same frame (else updateFrame() draws one frame of a
+  // running update: ruler, 0 %, hint).
+  ota::update(nowMs);
+
   // ---- which screen? ----
   // The update screen wins over everything: from OTA_BEGIN until the error screen times out / reboot.
   ui::Screen want = ota::active() ? ui::SCR_UPDATE
@@ -186,7 +191,12 @@ void loop() {
   }
 
   // ---- state ----
-  ota::update(nowMs);                                       // OTA timeouts, error screen timer, deferred reboot
+  // While a screen transition plays (update build-up, idle <-> nav, cancel sweep, curtain wipe) the RX queue stays held: the phone
+  // gets no "go ahead" ack and nothing is fed to the model, so no traffic steals frame time from the animation (stutter).
+  // BEGIN was acked at once; its chunks wait in the RX queue while the update screen builds up (flash writes would stall loop()).
+  // Released on the first frame after ui::transitionBusy() turns false.
+  if (ui::transitionBusy(nowMs)) { if (screen == ui::SCR_UPDATE) ota::keepAlive(); }
+  else                           ble.resumeRx();
   model.update(dt, nowMs);
   battery::update(nowMs);
   if (model.cfg.invert != appliedInvert) applyColors(model.cfg.invert);
@@ -222,7 +232,7 @@ void loop() {
   (void)flushUs;
 #endif
 
-  // ---- stats (once per second) ----
+  /*// ---- stats (once per second) ----
   statFrames++; statPx += px;
   uint32_t el = millis() - statT0;
   if (el >= 1000) {
@@ -237,5 +247,5 @@ void loop() {
                   model.active->freeSlots());
     statT0 = millis(); statFrames = 0; statPx = 0;
     statComposeUs = statPushUs = statProc = statSent = 0;
-  }
+  }*/
 }

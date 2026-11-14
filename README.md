@@ -1,7 +1,7 @@
-## 1.2.5
-# TahVia
+## 1.3.5
+# CubiNav
 
-TahVia is ESP32 firmware for a compact, Bluetooth-connected navigation display. It receives navigation state, route geometry, positioning updates and maneuver information from a companion phone application, then renders a monochrome navigation interface on a 480 × 320 TFT.
+CubiNav is ESP32 firmware for a compact, Bluetooth-connected navigation display. It receives navigation state, route geometry, positioning updates and maneuver information from a companion phone application, then renders a monochrome navigation interface on a 480 × 320 TFT.
 
 The firmware targets the **NodeMCU-32S (ESP32)** and uses the Arduino framework, PlatformIO, TFT_eSPI and NimBLE-Arduino.
 
@@ -39,15 +39,15 @@ The firmware initializes the display with `tft.setRotation(1)` and expects a 480
 - [PlatformIO](https://platformio.org/) (VS Code extension or PlatformIO Core CLI)
 - An ESP32 / NodeMCU-32S board
 - A compatible TFT display and a correctly configured TFT_eSPI setup
-- A phone application that implements the TahVia BLE protocol
+- A phone application that implements the CubiNav BLE protocol
 
 ### Build
 
 Clone the repository and build the configured environment:
 
 ```sh
-git clone https://github.com/cubicstarsdev2/TahVia.git
-cd TahVia
+git clone https://github.com/cubicstarsdev2/CubiNav.git
+cd CubiNav
 pio run
 ```
 
@@ -73,7 +73,7 @@ Build-time settings are defined primarily in `src/config.h`, `src/battery.h`, `s
 
 | Setting | Default | Description |
 | --- | --- | --- |
-| `DEVICE_NAME` | `TahVia` | BLE advertised device name |
+| `DEVICE_NAME` | `CubiNav` | BLE advertised device name |
 | `BLE_SERVICE_UUID` | `7a8f0001-3c5e-4b1a-9d27-5e1f4a6b7c80` | Navigation service |
 | `BLE_RX_UUID` | `7a8f0002-3c5e-4b1a-9d27-5e1f4a6b7c80` | Phone-to-device write characteristic |
 | `BLE_TX_UUID` | `7a8f0003-3c5e-4b1a-9d27-5e1f4a6b7c80` | Device-to-phone notification characteristic |
@@ -84,7 +84,7 @@ Build-time settings are defined primarily in `src/config.h`, `src/battery.h`, `s
 
 For bench testing only, pairing can be disabled with `-DBLE_REQUIRE_PAIRING=0`. Do not use an open BLE link for normal operation.
 
-The NimBLE implementation detects the installed NimBLE-Arduino major version and supports both the 1.x and 2.x callback APIs. If needed, `TAHVIA_NIMBLE_V2` can be forced with a build flag.
+The NimBLE implementation detects the installed NimBLE-Arduino major version and supports both the 1.x and 2.x callback APIs. If needed, `CUBINAV_NIMBLE_V2` can be forced with a build flag.
 
 ### Battery
 
@@ -209,7 +209,7 @@ When preparing a release, update `FW_VERSION_STRING` and the `## x.y.z` version 
 ## Repository layout
 
 ```text
-TahVia/
+CubiNav/
 ├── include/             # Project header include directory
 ├── lib/                 # Project-local PlatformIO libraries
 ├── src/                 # Firmware source

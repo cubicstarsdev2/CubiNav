@@ -1,5 +1,5 @@
-// TahVia UI - boot, idle/pairing, navigation HUD and firmware update screens.
-// Design language (from TahVia_UI.html): pure black on white, Inter Tight type, big numbers,
+// CubiNav UI - boot, idle/pairing, navigation HUD and firmware update screens.
+// Design language (from CubiNav_UI.html): pure black on white, Inter Tight type, big numbers,
 // a solid black turn banner, a thin status bar, 2 px rules and tracked small caps.
 // Everything goes through MonoTileRenderer: text/icons are 1-bpp sprites blitted as bitmaps.
 #include "ui.h"
@@ -85,6 +85,75 @@ const uint32_t POP_MS     = 260;       // idle: check badge pops in
 const uint32_t ICON_IN_MS = 260;       // nav: icon slides in on maneuver change
 const uint16_t TURN_NEAR_M = 120;      // nav: icon bobs when the turn is this close
 const uint16_t TURN_BAR_M  = 400;      // nav: proximity bar fills over the last 400 m
+// Idle <-> pairing transition (see "Idle <-> pairing transition" below). Set UI_PAIR_TRANSITION to 0 for a hard cut.
+#ifndef UI_PAIR_TRANSITION
+#define UI_PAIR_TRANSITION 1
+#endif
+const uint32_t PT_WIPE_MS       = 1000;  // curtain wipe, linear, the marker rides its edge
+const uint32_t PT_STAGE_MS      = 500;   // the pairing items run on their own clock, starting this long after the wipe began
+const uint32_t PT_IN_MS         = 2050;  // whole transition into pairing (wipe + bars + code roll + hints)
+const uint32_t PT_FLASH_MS      = 360;   // pairing accepted: digits flash inverted twice before the wipe back
+const uint32_t PT_FLASH_STEP_MS = 90;
+// Idle -> firmware update transition (see "Idle -> OTA transition" below). Set UI_OTA_TRANSITION to 0 for the plain curtain wipe.
+#ifndef UI_OTA_TRANSITION
+#define UI_OTA_TRANSITION 1
+#endif
+// Update -> idle transition when the update is cancelled (see "Update cancelled -> idle" below). 0 = plain curtain wipe.
+#ifndef UI_OTA_CANCEL_TRANSITION
+#define UI_OTA_CANCEL_TRANSITION 1
+#endif
+// Update -> "Update failed" and "Update failed" -> idle (see "Update failed" below). 0 = hard cut / plain curtain wipe.
+#ifndef UI_OTA_FAIL_TRANSITION
+#define UI_OTA_FAIL_TRANSITION 1
+#endif
+// Transition Speed Dividers, one per transition, each local to its own transition: it runs that many times SLOWER.
+// 1.0 = designed speed, 2.0 = twice as long, 0.5 = twice as fast. Must be > 0.
+//   UI_PAIR_SPEED_DIV         idle <-> pairing
+//   UI_OTA_SPEED_DIV          idle -> update
+//   UI_OTA_CANCEL_SPEED_DIV   update cancelled -> idle
+//   UI_OTA_FAIL_SPEED_DIV     update -> update failed
+//   UI_OTA_FAIL_EXIT_SPEED_DIV  update failed -> idle
+// Override with e.g. -DUI_OTA_SPEED_DIV=1.5f. Any left undefined takes UI_TRANSITION_SPEED_DIV (default 2.0f), kept only as a
+// shared fallback for older build flags.
+#ifndef UI_TRANSITION_SPEED_DIV
+#define UI_TRANSITION_SPEED_DIV 2.0f
+#endif
+#ifndef UI_PAIR_SPEED_DIV
+#define UI_PAIR_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+#ifndef UI_OTA_SPEED_DIV
+#define UI_OTA_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+#ifndef UI_OTA_CANCEL_SPEED_DIV
+#define UI_OTA_CANCEL_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+#ifndef UI_OTA_FAIL_SPEED_DIV
+#define UI_OTA_FAIL_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+#ifndef UI_OTA_FAIL_EXIT_SPEED_DIV
+#define UI_OTA_FAIL_EXIT_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+static_assert(UI_OTA_FAIL_SPEED_DIV > 0, "UI_OTA_FAIL_SPEED_DIV must be > 0");
+static_assert(UI_OTA_FAIL_EXIT_SPEED_DIV > 0, "UI_OTA_FAIL_EXIT_SPEED_DIV must be > 0");
+static_assert(UI_PAIR_SPEED_DIV > 0, "UI_PAIR_SPEED_DIV must be > 0");
+static_assert(UI_OTA_SPEED_DIV > 0, "UI_OTA_SPEED_DIV must be > 0");
+static_assert(UI_OTA_CANCEL_SPEED_DIV > 0, "UI_OTA_CANCEL_SPEED_DIV must be > 0");
+// Idle <-> navigation transitions (see "Idle <-> navigation transition" below). Set UI_NAV_TRANSITION to 0 for the plain curtain wipe.
+//   UI_NAV_SPEED_DIV        idle -> nav
+//   UI_NAV_EXIT_SPEED_DIV   nav -> idle
+#ifndef UI_NAV_TRANSITION
+#define UI_NAV_TRANSITION 1
+#endif
+#ifndef UI_NAV_SPEED_DIV
+#define UI_NAV_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+#ifndef UI_NAV_EXIT_SPEED_DIV
+#define UI_NAV_EXIT_SPEED_DIV UI_TRANSITION_SPEED_DIV
+#endif
+static_assert(UI_NAV_SPEED_DIV > 0, "UI_NAV_SPEED_DIV must be > 0");
+static_assert(UI_NAV_EXIT_SPEED_DIV > 0, "UI_NAV_EXIT_SPEED_DIV must be > 0");
+// Milliseconds since `start`, divided by that transition's own speed divider: transition code works on this scaled clock.
+inline uint32_t trElapsed(uint32_t now, uint32_t start, float div) { return (uint32_t)((float)(now - start) / div); }
 
 inline float easeOut(float p) { p = p < 0 ? 0 : (p > 1 ? 1 : p); return 1.f - (1.f - p) * (1.f - p); }
 inline float tri(uint32_t now, uint32_t period) {
@@ -133,6 +202,7 @@ struct TextSpr {
   TFT_eSprite* sp = nullptr;
   TFT_eSprite* halo = nullptr;       // optional white halo (text dilated by 2 px)
   int x = 0, y = 0, w = 0, h = 0;
+  int i0 = 0, i1 = 0;                // columns [i0, i1) that hold ink (set by finish); lets the clipper skip empty sprite area
   char cache[64] = {0};
 };
 enum Al : uint8_t { AL_L, AL_C, AL_R };
@@ -206,8 +276,24 @@ bool begin(TextSpr& t, const char* key) {
   t.sp->fillSprite(0);
   return true;
 }
+// Column range holding ink, so wide, mostly empty text sprites (480 px for a 110 px label) clip cheaply.
+void inkRange(TextSpr& t) {
+  t.i0 = t.i1 = 0;
+  const uint8_t* p = rawBits(t.sp);
+  if (!p) return;
+  const int ss = (t.w + 7) >> 3;
+  int lo = t.w, hi = -1;
+  for (int bx = 0; bx < ss; bx++) {
+    uint8_t acc = 0;
+    for (int y = 0; y < t.h; y++) acc |= p[y * ss + bx];
+    for (int k = 0; k < 8 && acc; k++)
+      if (acc & (0x80 >> k)) { const int c = bx * 8 + k; if (c < lo) lo = c; if (c > hi) hi = c; }
+  }
+  if (hi >= 0) { t.i0 = lo; t.i1 = hi + 1; }
+}
 void finish(TextSpr& t) {
   rebuildHalo(t);
+  inkRange(t);
   R->markDirtyRect(t.x, t.y, t.x + t.w - 1, t.y + t.h - 1);
 }
 
@@ -252,6 +338,64 @@ void blitHalo(const TextSpr& t) {          // white halo, then black text
   const uint8_t* ph = ptr(t.halo);
   if (ph) R->ovBitmap(t.x, t.y, t.w, t.h, ph, M_CLR);
   blit(t, M_SET);
+}
+
+// ---- Clipped drawing (screen transitions) --------------------------------------------------------------------
+// A transition shows two screens side by side, cut by a vertical line, so every element must be limited to a screen
+// column window [x0, x1). Rects and small dots clip trivially. A bitmap that crosses the window edge is copied
+// column-wise into a per-frame pool and drawn from there; one that is fully visible is drawn straight from its sprite
+// (so a full window, i.e. normal operation, issues exactly the commands it always did).
+// The renderer compares commands, not pixels, so every pooled copy marks its rect dirty by hand.
+const int CLIP_POOL = 6144;                                  // worst case seen in the transitions is about 4 KB
+uint8_t clipPool[CLIP_POOL];
+int     clipUsed = 0;
+inline void clipBegin() { clipUsed = 0; }                    // call once per frame
+
+struct Src { const uint8_t* p; int x, y, w, h, i0, i1; };    // a 1-bpp bitmap placed on screen; ink columns [i0, i1)
+inline Src srcOf(const TextSpr& t) { return Src{ptr(t.sp), t.x, t.y, t.w, t.h, t.i0, t.i1}; }
+inline Src srcOf(TFT_eSprite* s, int x, int y, int w, int h) { return Src{ptr(s), x, y, w, h, 0, w}; }
+
+// Draw `s` (shifted down by dy) limited to screen columns [x0, x1). [cs0, cs1) >= 0 draws only that slice of its columns.
+void blitClip(const Src& s, int x0, int x1, Mode m, int dy = 0, int cs0 = -1, int cs1 = -1) {
+  if (!s.p) return;
+  const bool slice = cs0 >= 0;
+  const int fa = s.x + (slice ? cs0 : s.i0), fb = s.x + (slice ? cs1 : s.i1);   // columns of interest, on screen
+  int a = fa, b = fb;
+  if (a < x0) a = x0;
+  if (b > x1) b = x1;
+  if (b <= a) return;
+  const int y0 = s.y + dy;
+  const int r0 = y0 < 0 ? -y0 : 0;                           // rows that stick out above the screen are dropped (banner sliding in/out)
+  const int rn = s.h - r0, y = y0 + r0;
+  if (rn <= 0) return;
+  const int ss = (s.w + 7) >> 3;
+  if (!slice && a == fa && b == fb) { R->ovBitmap(s.x, y, s.w, rn, s.p + r0 * ss, m); return; }   // fully visible: no copy
+  const int bw = b - a, ds = (bw + 7) >> 3, s0 = a - s.x, sb = s0 >> 3, sh = s0 & 7;
+  if (clipUsed + ds * rn > CLIP_POOL) return;                // pool exhausted: skip the element rather than corrupt memory
+  uint8_t* d = clipPool + clipUsed;
+  clipUsed += ds * rn;
+  const uint8_t tail = (bw & 7) ? (uint8_t)(0xFF << (8 - (bw & 7))) : 0xFF;
+  for (int r = 0; r < rn; r++) {
+    const uint8_t* row = s.p + (r0 + r) * ss;
+    uint8_t* o = d + r * ds;
+    for (int j = 0; j < ds; j++) {
+      const unsigned hi = row[sb + j], lo = (sb + j + 1 < ss) ? row[sb + j + 1] : 0;
+      o[j] = (uint8_t)((((hi << 8) | lo) << sh) >> 8);
+    }
+    o[ds - 1] &= tail;
+  }
+  R->ovBitmap(a, y, bw, rn, d, m);
+  R->markDirtyRect(a, y, b - 1, y + rn - 1);
+}
+inline void blitC(const TextSpr& t, int x0, int x1, Mode m, int dy = 0) { blitClip(srcOf(t), x0, x1, m, dy); }
+
+inline void rectC(int x, int y, int w, int h, int x0, int x1, Mode m) {
+  const int a = x < x0 ? x0 : x, b = (x + w > x1) ? x1 : x + w;
+  if (b > a) R->ovFillRect(a, y, b - a, h, m);
+}
+// Small dots: kept whole when their centre is inside the window (the curtain bar hides the 1-2 px difference).
+inline void dotC(int cx, int cy, int r, int x0, int x1, Mode m) {
+  if ((x0 <= 0 && x1 >= SCREEN_W) || (cx >= x0 && cx < x1)) R->ovFillCircle(cx, cy, r, m);
 }
 
 // ---- Rounded rect (rect + 4 corner discs) --------------------------------------------------------
@@ -510,14 +654,18 @@ void emitBtDot(int cx, int cy, bool linked) {
   if (!linked) R->ovFillCircle(cx, cy, 3, M_CLR);
 }
 
-// Idle / pairing / update status bar. `withVer`: add the divider + version on the right.
-void emitStatusBar(const Hud& h, bool withVer) {
+// Idle / pairing / update status bar. A screen transition cuts it at the curtain bar, so it comes in two parts:
+// statusBase = frame + battery (the same on every screen), statusRight = BLUETOOTH label + dot, and with `withVer` the
+// divider + version, limited to screen columns [x0, x1).
+void statusBase(const Hud& h) {
   emitBarFrame();
   emitBattery(20, BOT_Y + 12, h.battPct, h.nowMs);
   setBattText(h);
   tBatt.x = 62; tBatt.y = BOT_Y + 7;
   blit(tBatt, M_SET);
+}
 
+void statusRight(const Hud& h, bool withVer, int x0, int x1, float verRetract = 0.f) {
   const int by = BOT_Y + 9;                                  // text sprites' top (baseline at BOT_Y+23)
   char v[24]; snprintf(v, sizeof(v), "V%s", FW_VERSION_STRING);
   setText(tBtLbl, "BLUETOOTH", FB11, AL_L, 14, 2);
@@ -529,17 +677,37 @@ void emitStatusBar(const Hud& h, bool withVer) {
     int verX = 460 - wV;
     int divX = verX - 11;
     tVerLbl.x = verX; tVerLbl.y = by;
-    blit(tVerLbl, M_SET);
-    R->ovFillRect(divX, BOT_Y + 12, 1, 14, M_SET);
+    if (verRetract <= 0.f) {
+      blitC(tVerLbl, x0, x1, M_SET);
+      rectC(divX, BOT_Y + 12, 1, 14, x0, x1, M_SET);
+    } else {                                                 // retracting: the visible part shrinks towards the right edge
+      const float e = verRetract >= 1.f ? 1.f : (verRetract < .5f ? 2.f * verRetract * verRetract : 1.f - 2.f * (1.f - verRetract) * (1.f - verRetract));
+      const int a = 460 - (int)lroundf(wV * (1.f - e));
+      const int aa = a < x0 ? x0 : a, bb = x1 < 460 ? x1 : 460;
+      if (a < 460 && aa < bb) blitClip(srcOf(tVerLbl), aa, bb, M_SET);
+      if (verRetract < .5f) rectC(divX, BOT_Y + 12, 1, 14, x0, x1, M_SET);
+    }
     cx = divX - 15;
     labelEnd = divX - 30;
   } else {
     cx = 455;
     labelEnd = 440;
   }
-  emitBtDot(cx, BOT_Y + 19, h.connected);
+  if (cx >= x0 && cx < x1) emitBtDot(cx, BOT_Y + 19, h.connected);
   tBtLbl.x = labelEnd - wB; tBtLbl.y = by;
-  blit(tBtLbl, M_SET);
+  blitC(tBtLbl, x0, x1, M_SET);
+}
+
+void emitStatusBar(const Hud& h, bool withVer, float verRetract = 0.f) {   // verRetract (0..1, only with withVer): the version is being retracted
+  statusBase(h);
+  statusRight(h, withVer, 0, SCREEN_W, verRetract);
+}
+
+// Cut at screen column x: the part to its left has the version (`verLeft`), the part to its right has not, or vice versa.
+void statusSplit(const Hud& h, int x, bool verLeft) {
+  statusBase(h);
+  if (x > 0)         statusRight(h, verLeft, 0, x);
+  if (x < SCREEN_W)  statusRight(h, !verLeft, x, SCREEN_W);
 }
 
 void emitFps(const Hud& h, bool show, int x, int y, bool halo) {
@@ -604,12 +772,33 @@ bool     turnWait = false;  uint8_t waitIcon = 0, waitRoute = 255;  uint16_t wai
 double   odoM = 0;  uint32_t odoIdx = 0;  uint8_t odoRoute = 255;  bool odoOk = false;
 const float DOT_PX = 9.f;
 
+// What the navigation screen shows, kept for the idle <-> nav transition (see "Idle <-> navigation transition").
+// Idle -> nav reads it live (navFrame fills it every frame of the entry); nav -> idle reads the last steady frame, because by
+// the time enter(SCR_IDLE) is called the route is gone from the model.
+const int NV_RS = 32;                                    // route vertices kept: the marker point + up to 31 projected vertices ahead
+struct NavSnap {
+  bool    valid = false;                                 // the last nav frame was a complete, steady one
+  uint8_t icon = 0, bmode = 0;                           // maneuver icon; banner: 0 normal, 1 rerouting, 2 arrived
+  float   bar = 0.f;                                     // proximity bar fill
+  bool    imp = false;
+  int     limit = 0;                                     // posted speed limit in the displayed unit, 0 = no sign
+  char    sp[8] = {0}, dir[4] = {0};                     // speed / heading texts
+  int     n = 0;                                         // route polyline in screen px: marker point, then the vertices ahead
+  float   rx[NV_RS], ry[NV_RS];
+  int     nodeMode = 0;                                  // 0 all wide, 1 turn node at nodeArc px along the polyline, 2 all thin
+  float   nodeArc = 0.f;
+  bool    endOk = false;                                 // the polyline ends at the real end of the route (destination ring)
+};
+NavSnap nvS;
+
 // Heading-up projection:
 //   sx = AX + s*(e*cos(t) - n*sin(t)),  sy = AY - s*(e*sin(t) + n*cos(t))
 // Only points near the cursor are projected, so cost does not depend on the route length.
 //   - behind the cursor: dotted trail
 //   - up to the next turn: 10 px; after it: 6 px; the turn gets a node; the end gets a destination ring
-void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
+// draw = false: only project and fill nvS (the idle -> nav transition draws the route itself, in the overlay).
+void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived, bool draw = true) {
+  nvS.n = 0; nvS.nodeMode = 0; nvS.endOk = false;
   const RouteRing& r = *m.active;
   if (r.count() < 2) return;
   const int32_t ix = (int32_t)lround(m.pose.x()), iy = (int32_t)lround(m.pose.y());
@@ -681,13 +870,13 @@ void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
   const float sy = PY[sj] + st * (PY[sj + 1] - PY[sj]);
 
   // Dotted trail: oldest visible point -> marker. Dots sit at fixed route distances (multiples of DOT_PX).
-  float next = 0;
-  {
+  if (draw) {
+    float next = 0;
     const float ph = fmodf((float)fmod(odoM * scale, (double)DOT_PX), DOT_PX);
     next = ph > 0.001f ? DOT_PX - ph : 0.f;
+    for (int q = 0; q < sj; q++) dottedSeg(PX[q], PY[q], PX[q + 1], PY[q + 1], next);
+    dottedSeg(PX[sj], PY[sj], sx, sy, next);
   }
-  for (int q = 0; q < sj; q++) dottedSeg(PX[q], PY[q], PX[q + 1], PY[q + 1], next);
-  dottedSeg(PX[sj], PY[sj], sx, sy, next);
 
   // Route distance (m) from the marker to every projected vertex ahead of it.
   static float ACC[BACK_MAX + FWD_MAX + 2];
@@ -772,6 +961,25 @@ void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
     }
   }
 
+  // Snapshot for the idle <-> nav transition: the marker point and up to NV_RS - 1 projected vertices ahead of it.
+  {
+    int k = 0;
+    nvS.rx[k] = sx; nvS.ry[k] = sy; k++;
+    for (int v = sj + 1; v < n && k < NV_RS; v++, k++) { nvS.rx[k] = PX[v]; nvS.ry[k] = PY[v]; }
+    nvS.n = k;
+    nvS.endOk = reachedEnd && k == n - sj;                  // nothing was cut off: the last point is the real end
+    nvS.nodeMode = mode;
+    if (mode == 1) {                                        // arc length (px) from the marker to the turn node
+      const int sg = na - sj;                               // snapshot segment sg -> sg+1 holds the node
+      if (sg >= 0 && sg < k) {
+        float acc = 0.f;
+        for (int i = 1; i <= sg; i++) acc += hypotf(nvS.rx[i] - nvS.rx[i - 1], nvS.ry[i] - nvS.ry[i - 1]);
+        nvS.nodeArc = acc + hypotf(nodeX - nvS.rx[sg], nodeY - nvS.ry[sg]);
+      } else nvS.nodeMode = 0;                              // beyond the part we keep: the kept road is all wide
+    }
+  }
+  if (!draw) return;
+
   // Route ahead: marker -> end. 10 px up to the node, 6 px after it.
   float fx = sx, fy = sy;
   for (int v = sj + 1; v < n; v++) {
@@ -851,6 +1059,1150 @@ const char* cardinal(float h) {
   return N[((int)((h + 22.5f) / 45.f)) & 7];
 }
 
+// =============================================================================================
+// Idle: the trail
+// A dotted road runs in from beyond the left edge and out beyond the right edge. While the phone is not connected a
+// marker laps it forever (it leaves on the right and re-enters on the left, so there is never a jump). When the phone
+// connects the marker finishes its lap, the road beyond the "?" pin is erased (the pin becomes the destination), and the
+// marker re-enters from the left and slows to a stop on the START point; the road behind it is erased as it goes.
+// On disconnect everything is restored and the marker resumes lapping.
+// The road is a fixed Bezier chain sampled once into a table (distance along the road -> x, y, heading).
+// =============================================================================================
+const float TR_YS = 0.86f;                    // design y -> panel y (the status bar takes the bottom 36 px)
+const int   TR_N = 3 * 48 + 1;
+const int   TR_MAX_DOTS = 64;
+const float TR_DOT_GAP = 14.f;                // px of road between dots
+float trX[TR_N], trY[TR_N], trS[TR_N];
+float trL = 1.f, trPinS = 0, trPinX = 0, trPinY = 0, trParkS = 0, trParkX = 0, trParkY = 0;
+int16_t trDotX[TR_MAX_DOTS], trDotY[TR_MAX_DOTS];
+float   trDotS[TR_MAX_DOTS];
+int     trDots = 0;
+
+TFT_eSprite *spCloud = nullptr, *spTreeA = nullptr, *spTreeB = nullptr, *spXMark = nullptr, *spPin = nullptr, *spTrailChev = nullptr, *spPill = nullptr, *spMorph = nullptr;
+TextSpr tPinQ, tStartL;
+int trailChevQ = -999;
+
+void trailAt(float s, float& x, float& y, float& deg) {
+  if (s < 0.f) s = 0.f;
+  if (s > trL) s = trL;
+  int i = 0;
+  while (i < TR_N - 2 && trS[i + 1] < s) i++;
+  const float seg = trS[i + 1] - trS[i];
+  const float u = seg > 0.f ? (s - trS[i]) / seg : 0.f;
+  x = trX[i] + (trX[i + 1] - trX[i]) * u;
+  y = trY[i] + (trY[i + 1] - trY[i]) * u;
+  deg = atan2f(trX[i + 1] - trX[i], -(trY[i + 1] - trY[i])) * 57.29577951f;   // clockwise from up
+}
+
+void buildTrail() {
+  static const float C[3][8] = {
+    {-30, 268, 50, 268, 110, 190, 200, 196},
+    {200, 196, 290, 202, 300, 262, 336, 206},
+    {336, 206, 372, 150, 430, 130, 510, 140}};
+  int n = 0;
+  for (int k = 0; k < 3; k++) {
+    const int steps = (k == 2) ? 49 : 48;
+    for (int i = 0; i < steps; i++) {
+      const float t = i / 48.f, u = 1.f - t;
+      const float a = u * u * u, b = 3 * u * u * t, c = 3 * u * t * t, d = t * t * t;
+      trX[n] = a * C[k][0] + b * C[k][2] + c * C[k][4] + d * C[k][6];
+      trY[n] = (a * C[k][1] + b * C[k][3] + c * C[k][5] + d * C[k][7]) * TR_YS;
+      n++;
+    }
+  }
+  trS[0] = 0.f;
+  for (int i = 1; i < TR_N; i++) trS[i] = trS[i - 1] + hypotf(trX[i] - trX[i - 1], trY[i] - trY[i - 1]);
+  trL = trS[TR_N - 1];
+  auto atX = [](float x, float& s, float& px, float& py) {        // the road's x only grows: nearest sample in x
+    int best = 0;
+    for (int i = 1; i < TR_N; i++) if (fabsf(trX[i] - x) < fabsf(trX[best] - x)) best = i;
+    s = trS[best]; px = trX[best]; py = trY[best];
+  };
+  atX(404.f, trPinS, trPinX, trPinY);                              // the pin's tip sits on the road
+  atX(56.f, trParkS, trParkX, trParkY);                            // where the marker parks (START)
+  trDots = 0;
+  for (float s = 0.f; s <= trL && trDots < TR_MAX_DOTS; s += TR_DOT_GAP) {
+    float x, y, d; trailAt(s, x, y, d);
+    if (x < -3.f || x > SCREEN_W + 3.f) continue;
+    trDotX[trDots] = (int16_t)lroundf(x); trDotY[trDots] = (int16_t)lroundf(y); trDotS[trDots] = s; trDots++;
+  }
+}
+
+// Keep only the outline (t px thick) of a filled 1-bpp shape. The sprite edge counts as outside.
+void outlineOf(TFT_eSprite* s, int w, int h, int t) {
+  uint8_t* p = rawBits(s);
+  static uint8_t tmp[64 * 32];
+  if (!p || w * h > (int)sizeof(tmp)) return;
+  for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) tmp[y * w + x] = getBit(p, w, h, x, y);
+  memset(p, 0, ((w + 7) >> 3) * h);
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++) {
+      if (!tmp[y * w + x]) continue;
+      bool edge = false;
+      for (int dy = -t; dy <= t && !edge; dy++)
+        for (int dx = -t; dx <= t; dx++) {
+          const int xx = x + dx, yy = y + dy;
+          if (xx < 0 || yy < 0 || xx >= w || yy >= h || !tmp[yy * w + xx]) { edge = true; break; }
+        }
+      if (edge) setBit(p, w, h, x, y);
+    }
+}
+
+void buildIdleArt() {
+  mkSprite(spCloud, 56, 28);                                 // cloud outline
+  spCloud->fillCircle(10, 18, 9, 1); spCloud->fillCircle(26, 12, 12, 1); spCloud->fillCircle(44, 17, 9, 1);
+  spCloud->fillRect(10, 18, 35, 10, 1);
+  outlineOf(spCloud, 56, 28, 3);
+
+  mkSprite(spTreeA, 28, 44);                                 // round tree (3 px outline) on a trunk
+  spTreeA->fillCircle(14, 14, 13, 1); spTreeA->fillCircle(14, 14, 10, 0); spTreeA->fillRect(13, 27, 3, 16, 1);
+  mkSprite(spTreeB, 22, 36);
+  spTreeB->fillCircle(11, 11, 10, 1); spTreeB->fillCircle(11, 11, 7, 0); spTreeB->fillRect(10, 21, 3, 14, 1);
+
+  mkSprite(spXMark, 14, 14);                                 // "x marks the spot"
+  thickLine(spXMark, 2, 2, 11, 11, 1); thickLine(spXMark, 11, 2, 2, 11, 1);
+
+  mkSprite(spPin, 34, 47);                                   // map pin, tip at (17, 46)
+  spPin->fillCircle(17, 17, 16, 1);
+  spPin->fillTriangle(3, 24, 31, 24, 17, 46, 1);
+
+  mkSprite(spTrailChev, 28, 28);
+  trailChevQ = -999;
+  mkSprite(spMorph, 28, 28);                                 // idle marker kite -> nav chevron (idle <-> nav transition)
+
+  mkSprite(spPill, 150, 26);                                 // status pill capsule (same shape idleScene() draws with primitives)
+  spPill->fillRect(13, 0, 124, 26, 1); spPill->fillCircle(13, 13, 13, 1); spPill->fillCircle(136, 13, 13, 1);
+
+  mk(tPinQ, 0, 0, 24, 26);                                   // "?" knocked out of the pin head (placed every frame)
+  setText(tPinQ, "?", S19, AL_C, 20);
+  mk(tStartL, (int)lroundf(trParkX) - 30, (int)lroundf(trParkY) + 32, 60, 16);
+  setText(tStartL, "START", FB11, AL_C, 12, 2);
+}
+
+// Marker = black disc with a white arrow pointing along the road (the logo's kite).
+void emitTrailMarker(int cx, int cy, float deg) {
+  const int q = (int)lroundf(deg / 6.f);
+  if (q != trailChevQ) {
+    trailChevQ = q;
+    const float a = q * 6.f * 0.017453292f, ca = cosf(a), sa = sinf(a);
+    const float P[4][2] = {{0, -10}, {8, 11}, {0, 6}, {-8, 11}};
+    int X[4], Y[4];
+    for (int i = 0; i < 4; i++) { X[i] = lroundf(14 + P[i][0] * ca - P[i][1] * sa); Y[i] = lroundf(14 + P[i][0] * sa + P[i][1] * ca); }
+    spTrailChev->fillSprite(0);
+    spTrailChev->fillTriangle(X[0], Y[0], X[1], Y[1], X[2], Y[2], 1);
+    spTrailChev->fillTriangle(X[0], Y[0], X[3], Y[3], X[2], Y[2], 1);
+    R->markDirtyRect(cx - 14, cy - 14, cx + 13, cy + 13);
+  }
+  R->ovFillCircle(cx, cy, 17, M_SET);
+  R->ovBitmap(cx - 14, cy - 14, 28, 28, ptr(spTrailChev), M_CLR);
+}
+
+// Marker, "damaged": just the 3 px outline of the disc, no arrow.
+void emitTrailMarkerHollow(int cx, int cy) {
+  R->ovCircle(cx, cy, 17, M_SET); R->ovCircle(cx, cy, 16, M_SET); R->ovCircle(cx, cy, 15, M_SET);
+}
+
+// IP_LOST / IP_ACCEL come after IP_READY on purpose: test "parked" with (IP_PARK || IP_READY), never with >=.
+enum IdlePhase : uint8_t { IP_SEARCH, IP_CATCH, IP_PARK, IP_READY, IP_LOST, IP_ACCEL };
+const float IP_LAP_S = 8.f;          // one lap while searching
+const float IP_PARK_S = 1.6f;        // slowing down onto START
+const float IP_CATCH_MULT = 4.0f;    // on connect the marker speeds up to this multiple of the lap speed to reach START sooner
+const float IP_CATCH_RAMP_S = 0.4f;  // ...ramping up over this long (no jump in speed)
+const float IP_TAIL_PXS = 120.f;     // road beyond the pin is erased at this speed (px/s)
+const float IP_REGROW_PXS = 300.f;   // ...and regrown at this speed on disconnect (from the pin and from the marker)
+// Disconnect ("the marker took damage"): LOST = START ring collapses, marker stands still, flickers disc/outline and jitters;
+// ACCEL = it eases from a standstill back up to lap speed while the road regrows; then SEARCH again.
+const uint32_t IP_LOST_MS = 350;       // LOST phase length
+const uint32_t IP_RING_MS = 250;       // START ring collapse (inside LOST)
+const uint32_t IP_BLINK_MS = 58;       // disc / outline flicker half-period (3 blinks in LOST_MS)
+const float    IP_ACCEL_S = 1.2f;      // ease-in back to lap speed
+const uint32_t IP_LOST_TEXT_MS = 1600; // pill + hint keep saying DISCONNECTED this long after the link dropped
+
+IdlePhase ipPh = IP_SEARCH;
+float     ipS = 0.f, ipTrimS = 0.f, ipTrimE = 1.f, ipParkT = 0.f;   // marker / visible road start / visible road end (px along the road)
+uint32_t  ipBobT = 0;                                      // the pin bobs on (now - ipBobT): a transition re-bases it so the pin starts at rest
+uint32_t  ipLast = 0, ipReadyT = 0, ipLostMs = 0;   // ipLostMs: when the link dropped (0 = not recently)
+float     ipBoost = 1.f;                                     // CATCH speed multiplier (1 .. IP_CATCH_MULT)
+float     ipRing0 = 0.f;                                     // START ring radius at the moment of the drop
+bool      ipFresh = true, ipConn = false;
+
+void idleUpdate(const Hud& h) {                              // the state machine (no drawing)
+  const uint32_t now = h.nowMs;
+  float dt = (now - ipLast) * 1e-3f;
+  ipLast = now;
+  if (dt > 0.1f) dt = 0.1f;                                    // first frame / returning from another screen
+
+  if (ipFresh) {                                               // screen just entered: no replay of the transition
+    ipFresh = false; ipConn = h.connected; ipLostMs = 0;
+    if (ipConn) { ipPh = IP_READY; ipS = trParkS; ipTrimS = trParkS; ipTrimE = trPinS; ipReadyT = now - 1000; }
+    else        { ipPh = IP_SEARCH; ipS = 0.f; ipTrimS = 0.f; ipTrimE = trL; }
+  }
+  if (h.connected != ipConn) {                                 // connect / disconnect
+    ipConn = h.connected;
+    if (ipConn) {
+      ipLostMs = 0;
+      if (ipPh == IP_SEARCH || ipPh == IP_LOST || ipPh == IP_ACCEL) ipPh = IP_CATCH;   // reconnected mid-transition: finish the lap, park
+    } else {
+#if UI_ANIMATIONS
+      ipLostMs = now ? now : 1;
+      if (ipPh == IP_READY || ipPh == IP_PARK) {
+        ipRing0 = ipPh == IP_READY ? 18.f + 8.f * easeOut((now - ipReadyT) / 250.f) : 0.f;
+        ipPh = IP_LOST;
+      } else ipPh = IP_SEARCH;                                 // dropped while still catching up: just keep lapping
+#else
+      ipPh = IP_SEARCH;
+#endif
+    }
+  }
+
+#if UI_ANIMATIONS
+  const float v = trL / IP_LAP_S;
+  if (ipPh != IP_CATCH) ipBoost = 1.f;
+  switch (ipPh) {
+    case IP_SEARCH: ipS += v * dt; if (ipS >= trL) ipS -= trL; break;
+    case IP_CATCH:
+      ipBoost += (IP_CATCH_MULT - 1.f) / IP_CATCH_RAMP_S * dt; if (ipBoost > IP_CATCH_MULT) ipBoost = IP_CATCH_MULT;
+      ipS += v * ipBoost * dt;
+      if (ipS >= trL) { ipS = 0.f; ipParkT = 0.f; ipPh = IP_PARK; } break;
+    case IP_PARK: {
+      ipParkT += dt;
+      float p = ipParkT / IP_PARK_S;
+      if (p >= 1.f) { p = 1.f; ipPh = IP_READY; ipReadyT = now; }
+      const float e = 1.f - (1.f - p) * (1.f - p) * (1.f - p);
+      ipS = trParkS * e;
+      break;
+    }
+    case IP_LOST:
+      if ((uint32_t)(now - ipLostMs) >= IP_LOST_MS) { ipPh = IP_ACCEL; ipParkT = 0.f; }
+      break;                                                   // marker stands still
+    case IP_ACCEL: {
+      ipParkT += dt;
+      float p = ipParkT / IP_ACCEL_S;
+      if (p >= 1.f) { p = 1.f; ipPh = IP_SEARCH; }
+      ipS += v * p * p * (3.f - 2.f * p) * dt;                 // smoothstep: 0 -> lap speed
+      if (ipS >= trL) ipS -= trL;
+      break;
+    }
+    default: ipS = trParkS; break;
+  }
+#else
+  if (ipConn) { ipPh = IP_READY; ipS = trParkS; ipReadyT = now - 1000; } else { ipPh = IP_SEARCH; ipS = trL * 0.5f; }
+#endif
+
+  const bool parked = ipPh == IP_PARK || ipPh == IP_READY;
+  if (ipConn) {
+    const bool tail = parked || (ipPh == IP_CATCH && ipS >= trPinS);   // erase after the marker passed the pin
+    if (tail) { ipTrimE -= IP_TAIL_PXS * dt; if (ipTrimE < trPinS) ipTrimE = trPinS; }
+    ipTrimS = parked ? ipS : 0.f;                                        // erased behind the marker
+  } else if (ipPh != IP_LOST) {                                // regrowth starts when the marker pulls away
+    ipTrimS -= IP_REGROW_PXS * dt; if (ipTrimS < 0.f) ipTrimS = 0.f;
+    ipTrimE += IP_REGROW_PXS * dt; if (ipTrimE > trL) ipTrimE = trL;
+  }
+
+}
+
+// Draw the scene back to front, limited to screen columns [x0, x1) (a transition cuts it at the curtain).
+// The marker is left out during a transition: the curtain's own marker takes its place.
+void idleDraw(const Hud& h, int x0, int x1, bool marker) {
+  const uint32_t now = h.nowMs;
+  const bool full = x0 <= 0 && x1 >= SCREEN_W;
+
+  blitClip(srcOf(spCloud, 276, 12, 56, 28), x0, x1, M_SET);
+  blitClip(srcOf(spTreeA, 86, 128, 28, 44), x0, x1, M_SET);
+  blitClip(srcOf(spTreeB, 429, 186, 22, 36), x0, x1, M_SET);
+  blitClip(srcOf(spXMark, 233, 125, 14, 14), x0, x1, M_SET);
+
+  for (int i = 0; i < trDots; i++)
+    if (trDotS[i] >= ipTrimS && trDotS[i] <= ipTrimE) dotC(trDotX[i], trDotY[i], 2, x0, x1, M_SET);
+
+#if UI_ANIMATIONS
+  const int bob = (int)lroundf(tri(now - ipBobT, 1800) * 6.f);
+#else
+  const int bob = 0;
+#endif
+  const int pinX = (int)lroundf(trPinX) - 17, pinY = (int)lroundf(trPinY) - 46 - bob;
+  blitClip(srcOf(spPin, pinX, pinY, 34, 47), x0, x1, M_SET);
+  tPinQ.x = pinX + 5; tPinQ.y = pinY + 4;
+  blitC(tPinQ, x0, x1, M_CLR);
+
+  if (full && ipPh == IP_READY) {                              // START ring + label
+    const float e = easeOut((now - ipReadyT) / 250.f);
+    const int r = 18 + (int)lroundf(8.f * e), cx = (int)lroundf(trParkX), cy = (int)lroundf(trParkY);
+    R->ovCircle(cx, cy, r, M_SET); R->ovCircle(cx, cy, r - 1, M_SET); R->ovCircle(cx, cy, r - 2, M_SET);
+    if (e >= 0.5f) blit(tStartL, M_SET);
+  }
+
+  if (full && ipPh == IP_LOST) {                               // START ring collapses (label is already gone)
+    const float r = ipRing0 * (1.f - easeOut((now - ipLostMs) / (float)IP_RING_MS));
+    if (r >= 3.f) {
+      const int ri = (int)lroundf(r), cx = (int)lroundf(trParkX), cy = (int)lroundf(trParkY);
+      R->ovCircle(cx, cy, ri, M_SET); R->ovCircle(cx, cy, ri - 1, M_SET); R->ovCircle(cx, cy, ri - 2, M_SET);
+    }
+  }
+
+  if (!marker) return;
+  float mx, my, mdeg;
+  trailAt(ipS, mx, my, mdeg);
+  if (mx > -20.f && mx < SCREEN_W + 20.f) {
+    int cx = (int)lroundf(mx), cy = (int)lroundf(my);
+    if (ipPh == IP_LOST) {                                     // damage: flicker disc <-> outline, shudder 2 px
+      const uint32_t el = now - ipLostMs;
+      static const int8_t JIT[4] = {0, 2, -2, 1};
+      cx += JIT[(el / 33) & 3];
+      if ((el / IP_BLINK_MS) & 1) emitTrailMarkerHollow(cx, cy);
+      else                        emitTrailMarker(cx, cy, mdeg);
+    } else {
+      emitTrailMarker(cx, cy, mdeg);
+    }
+  }
+}
+
+// True while the pill / hint should say DISCONNECTED. Called by idleFrame() BEFORE idleUpdate(), hence the ipConn test:
+// it is still true on the very first frame after the drop, so the text never shows one frame of SEARCHING.
+bool idleLostText(const Hud& h) {
+  if (h.connected || ipFresh) return false;
+  return ipConn || (ipLostMs && (uint32_t)(h.nowMs - ipLostMs) < IP_LOST_TEXT_MS);
+}
+
+// Pill + hint texts for the current link state. Must run BEFORE idleUpdate() (see idleLostText).
+void idleTexts(const Hud& h) {
+  char stat[48];
+  if (!h.connected && idleLostText(h)) {                     // just dropped: say so for a moment (see "Idle: the trail")
+    setText(tStat, "DISCONNECTED", B12, AL_C, 17, 2);
+    setText(tHint, "Connection to phone lost.", S17, AL_L, 18);
+  } else if (!h.connected) {
+    static const char* DOTS[4] = {"", ".", "..", "..."};
+#if UI_ANIMATIONS
+    const char* dots = DOTS[(h.nowMs / 350) & 3];
+#else
+    const char* dots = DOTS[3];
+#endif
+    snprintf(stat, sizeof(stat), "SEARCHING%s", dots);
+    if (begin(tStat, stat)) {                                // centred on the full text, so the dots do not shift it
+      int w = textW(B12, "SEARCHING...", 2);
+      put(tStat, B12, stat, (tStat.w - w) / 2, 17, 2);
+      finish(tStat);
+    }
+    setText(tHint, "Your next trip starts in the app.", S17, AL_L, 18);
+  } else {
+    setText(tStat, "CONNECTED", B12, AL_C, 17, 2);
+    setText(tHint, "Pick a destination to start.", S17, AL_L, 18);
+  }
+}
+
+// The whole idle screen except the status bar, limited to screen columns [x0, x1).
+void idleScene(const Hud& h, int x0, int x1, bool marker) {
+  idleDraw(h, x0, x1, marker);                               // road, pin, marker (see "Idle: the trail")
+  blitC(tIdleT, x0, x1, M_SET);
+  blitC(tHint, x0, x1, M_SET);
+  if (x0 <= 0 && x1 >= SCREEN_W) {                           // status pill: black capsule, text knocked out
+    R->ovFillRect(tStat.x + 13, tStat.y, tStat.w - 26, tStat.h, M_SET);
+    R->ovFillCircle(tStat.x + 13, tStat.y + 13, 13, M_SET);
+    R->ovFillCircle(tStat.x + tStat.w - 14, tStat.y + 13, 13, M_SET);
+  } else {
+    blitClip(srcOf(spPill, tStat.x, tStat.y, tStat.w, tStat.h), x0, x1, M_SET);
+  }
+  blitC(tStat, x0, x1, M_CLR);
+}
+
+// =============================================================================================
+// Pairing screen
+// `pt` is the seconds since the pairing items started their own clock; pt >= 1.6 is the finished, steady screen.
+//   0.35 - 0.65  underline bars grow from their centres, 30 ms apart        0.40  PAIRING CODE label appears
+//   0.60 - 1.24  each digit flickers through random digits for 110 ms, left to right, then locks with a 3 px bump
+//   1.30 - 1.50  both hint lines open from the centre outwards
+// `inv` draws the code inverted (the flash when pairing succeeded). Everything is limited to screen columns [x0, x1).
+// =============================================================================================
+const int PCX[6] = {26, 86, 146, 222, 282, 342};             // digit centres inside tPDig
+const int PDX[6] = {0, 60, 120, 196, 256, 316};              // digit boxes (52 px) inside tPDig
+const int PUX[6] = {56, 116, 176, 252, 312, 372};            // underline bars on screen
+
+void pairDraw(const char* code, float pt, bool inv, int x0, int x1) {
+  setText(tPH1, "Enter this code on your phone", S17, AL_C, 19);
+  setText(tPH2, "The code is new every time you connect.", M14, AL_C, 16);
+
+  char chars[7]; int dy[6]; bool plain = true;               // plain: all six locked and still, so tPDig is drawn in one piece
+  for (int i = 0; i < 6; i++) {
+    const float st = 0.60f + 0.09f * i, lk = st + 0.11f;
+    dy[i] = 0;
+    if (pt < st) { chars[i] = ' '; plain = false; }
+    else if (pt < lk) {                                      // same flicker sequence as the prototype: one step per 40 ms
+      const int f = (int)(pt * 25.f);
+      chars[i] = (char)('0' + (f * (7 + i) + 3 * i) % 10);
+      plain = false;
+    } else {
+      chars[i] = code[i];
+      if (pt - lk < 0.08f) { dy[i] = -(int)lroundf(3.f * (1.f - (pt - lk) / 0.08f)); if (dy[i]) plain = false; }
+    }
+  }
+  chars[6] = 0;
+  if (begin(tPDig, chars)) {                                 // six digits, each centred in a 52 px box (hidden ones left out)
+    for (int i = 0; i < 6; i++) {
+      if (chars[i] == ' ') continue;
+      const char one[2] = {chars[i], 0};
+      put(tPDig, D64, one, PCX[i] - textW(D64, one, 0) / 2, 55, 0);
+    }
+    finish(tPDig);
+  }
+
+  blitClip(srcOf(spLogoSmall, 20, 16, LOGO_SMALL, LOGO_SMALL), x0, x1, M_SET);
+  blitC(tPTitle, x0, x1, M_SET);
+  blitC(tPTag, x0, x1, M_SET);
+  if (pt > 0.40f) blitC(tPLbl, x0, x1, M_SET);
+
+  for (int i = 0; i < 6; i++) {
+    const int w = (int)lroundf(52.f * easeOut((pt - 0.35f - 0.03f * i) / 0.15f));
+    if (w > 0) rectC(PUX[i] + (52 - w) / 2, 178, w, 4, x0, x1, M_SET);
+  }
+
+  const Mode dm = inv ? M_CLR : M_SET;
+  if (inv) rectC(56, 104, 368, 72, x0, x1, M_SET);
+  if (plain) blitC(tPDig, x0, x1, dm);
+  else for (int i = 0; i < 6; i++)
+    if (chars[i] != ' ') blitClip(srcOf(tPDig), x0, x1, dm, dy[i], PDX[i], PDX[i] + 52);
+
+  const int hw = (int)lroundf(SCREEN_W * easeOut((pt - 1.3f) / 0.2f));
+  if (hw > 0) {
+    int a = SCREEN_W / 2 - hw / 2, b = a + hw;
+    if (a < x0) a = x0;
+    if (b > x1) b = x1;
+    blitC(tPH1, a, b, M_SET);
+    blitC(tPH2, a, b, M_SET);
+  }
+}
+
+// =============================================================================================
+// Idle <-> pairing transition
+// The marker pulls the next screen in. A 3 px curtain bar sweeps left to right along the road (PT_WIPE_MS, linear) with
+// the marker riding it; the old screen is on one side of the bar, the new one on the other.
+//   IN   (Hud::pairing rises)          idle -> pairing, then the staged build-up of pairDraw().
+//   OUT  (Hud::pairing falls)          pairing -> idle. If Hud::connected is true at that moment the code was accepted:
+//                                      the digits flash inverted twice, then the wipe runs with the normal marker and
+//                                      idle resumes with the marker re-entering at the road start (CATCH). Otherwise
+//                                      the wipe starts at once, the marker rides as the damaged outline and idle goes
+//                                      back to SEARCHING.
+// The idle state machine is frozen (and reset to a calm SEARCHING, road fully drawn, marker off the left edge) for the
+// whole transition, so the frame after it simply carries on from there.
+// =============================================================================================
+enum PairTr : uint8_t { PTR_NONE, PTR_IN, PTR_OUT };
+PairTr   ptMode = PTR_NONE;
+bool     ptFresh = true, ptPrev = false, ptOk = false;
+uint32_t ptStart = 0;
+char     ptCode[8] = "000000";                               // last passkey seen while pairing (Hud::passkey may be cleared at the end)
+
+void idleReset(uint32_t now) {
+  ipFresh = false; ipConn = false; ipPh = IP_SEARCH;
+  ipS = 0.f; ipTrimS = 0.f; ipTrimE = trL; ipBoost = 1.f; ipLostMs = 0; ipLast = now;
+}
+
+// Nearest road sample in x (the road's x only grows) -> its distance along the road.
+float trailSAtX(float x) {
+  int best = 0;
+  for (int i = 1; i < TR_N; i++) if (fabsf(trX[i] - x) < fabsf(trX[best] - x)) best = i;
+  return trS[best];
+}
+
+inline int wipeX(uint32_t el) {
+  return el >= PT_WIPE_MS ? SCREEN_W : (int)(SCREEN_W * (el / (float)PT_WIPE_MS) + 0.5f);
+}
+
+// The curtain edge: a bar with the marker riding it along the road.
+void pairEdge(int wx, bool hollow) {
+  R->ovFillRect(wx - 3, 0, 3, SCREEN_H, M_SET);
+  float mx, my, md;
+  trailAt(trailSAtX((float)wx), mx, my, md);
+  if (hollow) emitTrailMarkerHollow(wx, (int)lroundf(my));
+  else        emitTrailMarker(wx, (int)lroundf(my), md);
+}
+
+void transIn(const Hud& h, uint32_t el) {                    // idle on the right of the curtain, pairing on the left
+  const int wx = wipeX(el);
+  const float pt = ((int32_t)el - (int32_t)PT_STAGE_MS) * 1e-3f;
+  if (wx < SCREEN_W) { idleTexts(h); idleScene(h, wx, SCREEN_W, false); }
+  pairDraw(ptCode, pt, false, 0, wx);
+  emitStatusBar(h, true);
+  if (wx < SCREEN_W) pairEdge(wx, false);
+}
+
+void transOut(const Hud& h, uint32_t el) {                   // idle on the left of the curtain, pairing on the right
+  const uint32_t fl = ptOk ? PT_FLASH_MS : 0;
+  if (el < fl) {                                             // accepted: flash the code
+    pairDraw(ptCode, 99.f, (el / PT_FLASH_STEP_MS) % 2 == 0, 0, SCREEN_W);
+    emitStatusBar(h, true);
+    return;
+  }
+  const uint32_t ew = el - fl;
+  const int wx = wipeX(ew);
+  if (wx < SCREEN_W) pairDraw(ptCode, 99.f, false, wx, SCREEN_W);
+  if (wx > 0) { idleTexts(h); idleScene(h, 0, wx, false); }
+  emitStatusBar(h, true);
+  if (wx < SCREEN_W) pairEdge(wx, !ptOk && (ew / IP_BLINK_MS) % 2 == 1);
+}
+
+// Edge detection on Hud::pairing, and the end of a running transition.
+void pairTrUpdate(const Hud& h) {
+#if UI_ANIMATIONS && UI_PAIR_TRANSITION
+  const uint32_t now = h.nowMs;
+  if (ptFresh) { ptFresh = false; ptPrev = h.pairing; ptMode = PTR_NONE; return; }   // screen just entered: no replay
+  if (h.pairing != ptPrev) {
+    ptPrev = h.pairing;
+    ptStart = now;
+    idleReset(now);
+    if (h.pairing) ptMode = PTR_IN;
+    else { ptMode = PTR_OUT; ptOk = h.connected; }
+  }
+  const uint32_t el = trElapsed(now, ptStart, (float)UI_PAIR_SPEED_DIV);
+  if (ptMode == PTR_IN && el >= PT_IN_MS) ptMode = PTR_NONE;
+  else if (ptMode == PTR_OUT && el >= (ptOk ? PT_FLASH_MS : 0) + PT_WIPE_MS) ptMode = PTR_NONE;
+#else
+  (void)h;
+#endif
+}
+
+// =============================================================================================
+// Idle -> OTA transition (port of "CubiNav: IDLE to OTA transition.html")
+// Starts by itself when enter(SCR_UPDATE) is called while the idle screen was showing; it plays inside updateFrame().
+// The road becomes the progress ruler: the scenery closes, a wave flattens the dots onto the ruler line while the marker
+// drives off, then the update screen builds on top. T = seconds on the scaled clock (see UI_OTA_SPEED_DIV):
+//   0.00 - 0.45  scenery closes toward its own centre line, 40 ms apart; START ring collapses; version retracts (0 - 0.25);
+//                the marker accelerates away
+//   0.25 - 1.10  wave from the marker: each dot eases onto the ruler line; the marker flattens and leaves to the right
+//   1.00 - 1.55  rule grows from the centre, ticks drop in, label opens, percent rolls once and locks
+//   1.35 - 1.85  KB count and version open from their centres, then the hint with its padlock
+// During the transition everything is drawn in the overlay; at the end the ruler moves into BASE (updateRuler()).
+// =============================================================================================
+const int   OT_RX = 49, OT_RW = 382, OT_RY = 182;            // ruler: x, width, rule y
+const float OT_END = 1.85f;
+
+bool     otActive = false, otPending = false, otConn = false, otRing = false;
+uint32_t otStart = 0;
+float    otS0 = 0.f, otV0 = 0.f, otXm = 0.f;                 // marker start (px along the road), start speed, wave origin x
+int      otN = 0;
+int16_t  otDX[TR_MAX_DOTS], otDY[TR_MAX_DOTS], otDT[TR_MAX_DOTS];   // dots: start x, y, and target x on the ruler
+
+inline float easeIO(float p) { p = p < 0 ? 0 : (p > 1 ? 1 : p); return p < .5f ? 2.f * p * p : 1.f - 2.f * (1.f - p) * (1.f - p); }
+
+// Window [a, b) of an element that squeezes shut toward its centre (p 0..1). False once closed.
+inline bool shutWin(int x0, int x1, float p, int& a, int& b) {
+  if (p >= 1.f) return false;
+  const float e = easeOut(p), c = (x0 + x1) * .5f, hw = (x1 - x0) * .5f * (1.f - e);
+  a = (int)lroundf(c - hw); b = (int)lroundf(c + hw);
+  return b > a;
+}
+// Window of an element that opens from its centre (p 0..1). Fully open = the whole screen (no clipping).
+inline bool openWin(int cx, int hw, float p, int& a, int& b) {
+  if (p >= 1.f) { a = 0; b = SCREEN_W; return true; }
+  const float e = easeOut(p);
+  a = (int)lroundf(cx - hw * e); b = (int)lroundf(cx + hw * e);
+  return b > a;
+}
+
+// The curtain bar (3 px, its right edge at bx) with the marker riding it, used by the cancel -> idle transition.
+void curtainBar(int bx, int my, float deg, bool hollow = false) {
+  const int a = bx - 3 < 0 ? 0 : bx - 3;
+  if (bx > a) R->ovFillRect(a, 0, bx - a, SCREEN_H, M_SET);
+  if (hollow) emitTrailMarkerHollow(bx, my);                 // the damaged marker (failure)
+  else        emitTrailMarker(bx, my, deg);
+}
+
+// Static ruler under the progress bar (BASE).
+void updateRuler() {
+  R->baseFillRect(OT_RX, OT_RY, OT_RW, 2, M_SET);
+  for (int i = 0; i <= 20; i++) R->baseFillRect(OT_RX + i * 19, 186, 2, 8, M_SET);
+  for (int i = 0; i < 5; i++)   R->baseFillRect(OT_RX + i * 95, 186, 2, 14, M_SET);
+}
+
+// Called from enter(): snapshot the idle state the transition starts from.
+void otBegin() {
+  const float v = trL / IP_LAP_S;
+  const bool still = ipPh == IP_PARK || ipPh == IP_READY || ipPh == IP_LOST;
+  otConn = ipConn;
+  otRing = ipPh == IP_READY;
+  otS0 = ipS;
+  otV0 = still ? 0.f : v * (ipPh == IP_CATCH ? ipBoost : 1.f);
+  float x, y, d; trailAt(ipS, x, y, d);
+  otXm = x < 0.f ? 0.f : (x > SCREEN_W ? (float)SCREEN_W : x);
+  otN = 0;
+  for (int i = 0; i < trDots; i++)
+    if (trDotS[i] >= ipTrimS && trDotS[i] <= ipTrimE) { otDX[otN] = trDotX[i]; otDY[otN] = trDotY[i]; otN++; }
+  for (int i = 0; i < otN; i++) otDT[i] = otN > 1 ? (int16_t)(OT_RX + (OT_RW * i) / (otN - 1)) : (int16_t)240;
+  otActive = otPending = true;
+}
+
+// Scenery that closes + the dots that flatten onto the ruler line.
+void otIdleLayer(const Hud& h, float T) {
+  Hud hh = h; hh.connected = otConn;                         // texts stay as they were on the idle screen
+  idleTexts(hh);
+  auto p = [T](int i) { return (T - i * .04f) / .2f; };
+  int a, b;
+  if (shutWin(276, 338, p(0), a, b)) blitClip(srcOf(spCloud, 276, 12, 56, 28), a, b, M_SET);
+  if (shutWin(86, 114, p(1), a, b))  blitClip(srcOf(spTreeA, 86, 128, 28, 44), a, b, M_SET);
+  if (shutWin(233, 247, p(2), a, b)) blitClip(srcOf(spXMark, 233, 125, 14, 14), a, b, M_SET);
+  if (shutWin(429, 451, p(3), a, b)) blitClip(srcOf(spTreeB, 429, 186, 22, 36), a, b, M_SET);
+
+  const float rw = OT_RW * easeOut((T - 1.f) / .25f);        // dots hide under the rule once it has grown over them
+  for (int i = 0; i < otN; i++) {
+    const float q = easeIO((T - (.25f + fabsf(otDX[i] - otXm) / 900.f)) / .3f);
+    if (q >= 1.f && fabsf(otDT[i] - 240.f) <= rw * .5f) continue;
+    R->ovFillCircle((int)lroundf(otDX[i] + (otDT[i] - otDX[i]) * q), (int)lroundf(otDY[i] + (OT_RY + 1 - otDY[i]) * q), 2, M_SET);
+  }
+
+  const int bob = (int)lroundf(tri(h.nowMs, 1800) * 6.f), pcx = (int)lroundf(trPinX);
+  if (shutWin(pcx - 17, pcx + 17, p(4), a, b)) {
+    const int pinX = pcx - 17, pinY = (int)lroundf(trPinY) - 46 - bob;
+    blitClip(srcOf(spPin, pinX, pinY, 34, 47), a, b, M_SET);
+    tPinQ.x = pinX + 5; tPinQ.y = pinY + 4;
+    blitC(tPinQ, a, b, M_CLR);
+  }
+  if (otRing && p(5) < 1.f) {                                // START ring collapses
+    const float r = 26.f * (1.f - easeOut(p(5)));
+    if (r >= 3.f) {
+      const int ri = (int)lroundf(r), cx = (int)lroundf(trParkX), cy = (int)lroundf(trParkY);
+      R->ovCircle(cx, cy, ri, M_SET); R->ovCircle(cx, cy, ri - 1, M_SET); R->ovCircle(cx, cy, ri - 2, M_SET);
+      if (p(5) < .3f) blit(tStartL, M_SET);
+    }
+  }
+  if (shutWin(28, 270, p(6), a, b)) blitC(tIdleT, a, b, M_SET);
+  if (shutWin(28, 280, p(7), a, b)) blitC(tHint, a, b, M_SET);
+  if (shutWin(306, 456, p(8), a, b)) {
+    blitClip(srcOf(spPill, tStat.x, tStat.y, tStat.w, tStat.h), a, b, M_SET);
+    blitC(tStat, a, b, M_CLR);
+  }
+}
+
+// The marker: accelerates from its idle speed to 900 px/s, flattens onto the ruler line and drives off to the right.
+void otMarker(float T) {
+  const float acc = 900.f - otV0;
+  const float s = otS0 + otV0 * T + acc * (T < .3f ? T * T / .6f : .15f + (T - .3f));
+  float x, y, d; trailAt(s, x, y, d);
+  const float w = easeIO((T - .15f) / .3f);
+  if (x > -20.f && x < SCREEN_W + 20.f)
+    emitTrailMarker((int)lroundf(x), (int)lroundf(y + (OT_RY + 1 - y) * w), d + (90.f - d) * w);
+}
+
+// Huge percent, centred as digits + "%". withPct = false while the digit is still rolling.
+void renderPct(const char* digits, bool withPct) {
+  char key[12];
+  snprintf(key, sizeof(key), "%s%s", withPct ? "" : "~", digits);
+  if (!begin(tUpPct, key)) return;
+  const int wD = textW(D104, digits, -4), wP = textW(P40, "%", 0);
+  const int x = (tUpPct.w - (wD + 6 + wP)) / 2;
+  const int e = put(tUpPct, D104, digits, x, 84, -4);
+  if (withPct) put(tUpPct, P40, "%", e + 6 + 4, 84, 0);      // +4: undo the trailing negative tracking
+  finish(tUpPct);
+}
+
+// "FROM -> TO" under the progress bar.
+void upVerText(decltype(ota::Info::version) v) {
+  char b[48];
+  snprintf(b, sizeof(b), "%u.%u.%u -> %u.%u.%u",
+           (unsigned)FW_V_MAJOR(FW_VERSION), (unsigned)FW_V_MINOR(FW_VERSION), (unsigned)FW_V_PATCH(FW_VERSION),
+           (unsigned)FW_V_MAJOR(v), (unsigned)FW_V_MINOR(v), (unsigned)FW_V_PATCH(v));
+  setText(tUpVer, b, FB11, AL_R, 14, 2, 2);
+}
+
+// =============================================================================================
+// Update cancelled -> idle (port of "Proposed cancel -> IDLE" in CubiNav_Transition_Lab.html)
+// The firmware is told by main calling enter(SCR_IDLE) while a running update is on screen (no protocol change). The last
+// live update frame is remembered (up*) so the transition can start from exactly what the screen showed.
+//   0.00 - 0.30  drain: the bar drains right to left while the percent and the KB count fall in 50 ms steps;
+//                the hint changes to "Update cancelled." without the padlock
+//   0.30 - 0.55  hold: nothing moves (costs no tiles, gives the message time to be read)
+//   0.55 - 1.15  sweep: one curtain bar, the one the pairing transition uses, left to right; the marker starts on the ruler line and lifts
+//                onto the road. Behind the bar the idle screen returns (road whole, status bar with the version)
+// Then the idle state machine takes over from a reset (marker re-enters from the left and parks on START, like after a
+// successful pairing). Drawn in the overlay (BASE is blank). Not played when done, while verifying, or while the idle -> update
+// transition is still running: those get the plain curtain wipe.
+//
+// "Update failed": update -> failed (failBuild, inside updateFrame) and failed -> idle (cxFail: failClose, then the same sweep
+// with the damaged marker). Neither is played if the screen was still building up.
+// =============================================================================================
+const float CX_DRAIN = .30f, CX_TS = .55f, CX_SWEEP = .60f;   // cancel: drain, hold, sweep
+const float FT_END = .90f;                                    // update -> failed
+const float FX_TS = .35f, FX_SWEEP = .60f;                    // failed -> idle: close, sweep
+
+int  upPct = 0;
+decltype(ota::Info::done)    upDone{};
+decltype(ota::Info::total)   upTotal{};
+decltype(ota::Info::version) upVer{};
+uint8_t upErr = 0;
+bool upLive = false;                                         // the last update frame showed a running update (not verifying)
+bool upShown = false;                                        // ... showed the progress screen (running or verifying)
+bool upSteady = false;                                       // ... and that screen was fully built (not in the idle -> update transition)
+bool upFailed = false;                                       // ... showed the failure screen
+bool cxActive = false, cxPending = false, cxFail = false;    // update -> idle transition (cxFail: after a failure, else after a cancel)
+uint32_t cxStart = 0;
+bool erActive = false, erPending = false;                    // update -> failed transition
+uint32_t erStart = 0;
+
+inline float cxTs()    { return cxFail ? FX_TS : CX_TS; }
+inline float cxSweep() { return cxFail ? FX_SWEEP : CX_SWEEP; }
+inline float cxEnd()   { return cxTs() + cxSweep(); }
+
+// ---- Failure screen pieces ----------------------------------------------------------------------------
+const int FL_CX = 240, FL_CY = 92, FL_R = 36;               // the disc with the cross
+inline int  inkX0(const TextSpr& t) { return t.x + t.i0; }
+inline int  inkX1(const TextSpr& t) { return t.x + t.i1; }
+inline bool shutInk(const TextSpr& t, float p, int& a, int& b) { return shutWin(inkX0(t), inkX1(t), p, a, b); }
+inline bool openInk(const TextSpr& t, float p, int& a, int& b) { return openWin((inkX0(t) + inkX1(t)) / 2, (inkX1(t) - inkX0(t)) / 2, p, a, b); }
+
+void failDisc(int r) {                                       // black disc, white cross knocked out once it is big enough
+  if (r < 1) return;
+  R->ovFillCircle(FL_CX, FL_CY, r, M_SET);
+  if (r < 20) return;
+  const int o = (int)lroundf(12.f * r / (float)FL_R);
+  R->ovLine(FL_CX - o, FL_CY - o, FL_CX + o, FL_CY + o, 7, M_CLR);
+  R->ovLine(FL_CX + o, FL_CY - o, FL_CX - o, FL_CY + o, 7, M_CLR);
+}
+
+void failTexts() {
+  setText(tFailE, ota::errorText(upErr), S19, AL_C, 21);
+  setText(tFailH, "Old firmware kept. Try again in the app.", M14, AL_C, 14);
+}
+
+// Update -> failed. The progress screen squeezes shut toward its centre line (40 ms apart), then the failure screen opens:
+// disc, title, error, hint. ft = scaled seconds. The label at the top stays.
+//   0.00 - 0.32  ruler + bar | percent | KB + version | hint close
+//   0.30 - 0.55  disc grows, the cross appears
+//   0.45 - 0.85  title, error text and hint open from their centres
+void failBuild(float ft) {
+  R->ovFillRect(OT_RX, 172, OT_RW, 30, M_CLR);               // hide the ruler of the BASE layer
+  auto p = [ft](int i) { return (ft - i * .04f) / .2f; };
+  int a, b;
+  if (shutWin(OT_RX, OT_RX + OT_RW, p(0), a, b)) {
+    rectC(OT_RX, OT_RY, OT_RW, 2, a, b, M_SET);
+    for (int i = 0; i <= 20; i++) rectC(OT_RX + i * 19, 186, 2, i % 5 ? 8 : 14, a, b, M_SET);
+    const int fw = OT_RW * upPct / 100;
+    if (fw > 0) rectC(OT_RX, 172, fw, 10, a, b, M_SET);
+  }
+  char s[48];
+  snprintf(s, sizeof(s), "%d", upPct);
+  renderPct(s, true);
+  if (shutInk(tUpPct, p(1), a, b)) blitClip(srcOf(tUpPct), a, b, M_SET);
+  snprintf(s, sizeof(s), "%lu / %lu KB", (unsigned long)((upDone + 512) / 1024), (unsigned long)((upTotal + 512) / 1024));
+  setText(tUpKB, s, B14, AL_L, 16);
+  if (shutInk(tUpKB, p(2), a, b)) blitClip(srcOf(tUpKB), a, b, M_SET);
+  upVerText(upVer);
+  if (shutInk(tUpVer, p(2), a, b)) blitClip(srcOf(tUpVer), a, b, M_SET);
+  const char* msg = "Keep the app open. Do not power off.";
+  setText(tUpHint, msg, S14, AL_L, 16);
+  const int total = 22 + textW(S14, msg, 0), x0 = (SCREEN_W - total) / 2;
+  tUpHint.x = x0 + 22;
+  if (shutWin(x0, x0 + total, p(3), a, b)) {
+    blitClip(srcOf(spLock, x0, 245, 14, 16), a, b, M_SET);
+    blitClip(srcOf(tUpHint), a, b, M_SET);
+  }
+  failDisc((int)lroundf(FL_R * easeOut((ft - .30f) / .25f)));
+  failTexts();
+  if (openInk(tFailT, (ft - .45f) / .2f, a, b)) blitClip(srcOf(tFailT), a, b, M_SET);
+  if (openInk(tFailE, (ft - .55f) / .2f, a, b)) blitClip(srcOf(tFailE), a, b, M_SET);
+  if (openInk(tFailH, (ft - .65f) / .2f, a, b)) blitClip(srcOf(tFailH), a, b, M_SET);
+}
+
+// Failed -> idle, first half: the failure screen (and the label) squeeze shut, 40 ms apart. t = scaled seconds.
+void failClose(float t) {
+  failTexts();
+  auto p = [t](int i) { return (t - i * .04f) / .2f; };
+  int a, b;
+  failDisc((int)lroundf(FL_R * (1.f - easeOut(p(0)))));
+  if (shutInk(tFailT, p(1), a, b)) blitClip(srcOf(tFailT), a, b, M_SET);
+  if (shutInk(tFailE, p(2), a, b)) blitClip(srcOf(tFailE), a, b, M_SET);
+  if (shutInk(tFailH, p(3), a, b)) blitClip(srcOf(tFailH), a, b, M_SET);
+  if (shutInk(tUpLbl, p(4), a, b)) blitClip(srcOf(tUpLbl), a, b, M_SET);
+}
+
+// Both update -> idle transitions share the sweep; tt = scaled seconds.
+//   cancel: the update screen drains, holds, then is swept away by the bar (marker lifts from the ruler line onto the road)
+//   failed: the failure screen closes (0 - 0.35), then the bar sweeps left to right with the damaged (hollow) marker on it,
+//           the same marker the pairing failure uses
+void cxDraw(const Hud& h, float tt) {
+  const float ts = cxTs();
+  const bool  sweep = tt >= ts;
+  const float u = sweep ? (tt - ts) / cxSweep() : 0.f;
+  const int   bx = sweep ? (int)lroundf((SCREEN_W + 18) * (u > 1.f ? 1.f : u)) : 0;
+  const int   ix = bx < SCREEN_W ? bx : SCREEN_W;            // idle on the columns [0, ix), the update screen on [ix, SCREEN_W)
+
+  if (ix > 0) {
+    Hud hh = h; hh.nowMs = ipBobT;                           // pin at rest, no ambient motion
+    idleTexts(hh);
+    idleScene(hh, 0, ix, false);
+  }
+
+  if (ix < SCREEN_W && cxFail) {
+    if (!sweep) failClose(tt);                               // after the sweep started the failure screen is gone
+  } else if (ix < SCREEN_W) {
+    const float q = floorf(tt / .05f) * .05f;                // the numbers count down in 50 ms steps, the bar continuously
+    const float keep = 1.f - easeIO(q / CX_DRAIN);
+    const int   shown = (int)lroundf(upPct * keep);
+    const int   barW = (int)lroundf(OT_RW * upPct / 100.f * (1.f - easeIO(tt / CX_DRAIN)));
+    char b[48];
+
+    blitClip(srcOf(tUpLbl), ix, SCREEN_W, M_SET);
+    rectC(OT_RX, OT_RY, OT_RW, 2, ix, SCREEN_W, M_SET);
+    for (int i = 0; i <= 20; i++) rectC(OT_RX + i * 19, 186, 2, i % 5 ? 8 : 14, ix, SCREEN_W, M_SET);
+    if (barW > 0) rectC(OT_RX, 172, barW, 10, ix, SCREEN_W, M_SET);
+
+    snprintf(b, sizeof(b), "%d", shown);
+    renderPct(b, true);
+    blitClip(srcOf(tUpPct), ix, SCREEN_W, M_SET);
+
+    snprintf(b, sizeof(b), "%lu / %lu KB", (unsigned long)(((float)upDone * keep + 512.f) / 1024.f), (unsigned long)((upTotal + 512) / 1024));
+    setText(tUpKB, b, B14, AL_L, 16);
+    blitClip(srcOf(tUpKB), ix, SCREEN_W, M_SET);
+    upVerText(upVer);
+    blitClip(srcOf(tUpVer), ix, SCREEN_W, M_SET);
+
+    const char* msg = "Update cancelled.";
+    setText(tUpHint, msg, S14, AL_L, 16);
+    tUpHint.x = (SCREEN_W - textW(S14, msg, 0)) / 2;
+    blitClip(srcOf(tUpHint), ix, SCREEN_W, M_SET);
+  }
+
+  statusSplit(h, ix, true);                                  // idle bar (with version) behind the bar, update bar ahead of it
+  if (sweep && u < 1.f) {
+    float x, y, d; trailAt(trailSAtX((float)bx), x, y, d);
+    if (cxFail) {
+      curtainBar(bx, (int)lroundf(y), d, true);
+    } else {
+      const float w = easeIO((tt - CX_TS) / .25f);
+      curtainBar(bx, (int)lroundf(OT_RY + 1 + (y - (OT_RY + 1)) * w), 90.f + (d - 90.f) * w);
+    }
+  }
+}
+
+// =============================================================================================
+// Idle <-> navigation transition (port of "CubiNav Idle-Nav Transitions.html")
+// The road you picked becomes the route. Both directions run NV_END (1.30) scaled seconds; T is on that scaled clock
+// (UI_NAV_SPEED_DIV / UI_NAV_EXIT_SPEED_DIV). Everything is drawn in the overlay while it runs and BASE stays blank; the last
+// frame uses the same projected route drawRoute() puts in BASE, so the hand-off to the map is seamless.
+//   Idle -> nav (inside navFrame(), after enter(SCR_NAV) from a connected idle screen; any other entry gets the curtain wipe)
+//     0.00 - 0.37  scenery squeezes shut toward its centres, 30 ms apart; START ring collapses; version / Bluetooth retract
+//     0.10 - 0.80  camera swing: the road turns rigidly about the parked marker until it points up, then settles vertex by vertex
+//                  on the real route; dots swell into dashes and then one solid line; the pin becomes the destination ring
+//     0.30 - 0.90  battery slides right, speed and heading open from their centres
+//     0.45 - 1.28  banner drops, builds (icon, distance, street, compass, rule), speed limit pops
+//   Nav -> idle (inside idleFrame(), after enter(SCR_IDLE) from a steady nav screen): the same, played backwards, ending on the
+//     parked marker with the START ring grown. Without a phone link (h.connected false) the marker is the damaged outline, there is
+//     no START ring, and idle resumes in the accelerating-SEARCHING state with DISCONNECTED text, like after a link drop.
+// The route target is nvS (marker point + up to 31 projected vertices), resampled by arc length onto the idle dots.
+// =============================================================================================
+const float NV_END  = 1.30f;
+const int   NV_MAX  = TR_MAX_DOTS;
+const float NV_KEND = 0.8f;                                  // the idle road is squeezed to this length while it swings
+
+bool     nvActive = false, nvPending = false, nvIn = true, nvConn = true;
+uint32_t nvStart = 0;
+int      nvBob = 0;                                          // pin bob (px) when the entry started
+int      nvN = 0;                                            // idle dots START -> pin
+float    nvSX = 0.f, nvSY = 0.f, nvDeg0 = 0.f, nvLead = 0.f; // START (parked marker), its heading, offset of the first dot ahead of it
+float    nvAX[NV_MAX], nvAY[NV_MAX];                         // the dots on the idle road
+float    nvBX[NV_MAX], nvBY[NV_MAX];                         // the same dots laid on the route
+float    nvPX[NV_MAX], nvPY[NV_MAX];                         // current positions (morph)
+float    nvNodeF = 1e9f;                                     // fractional dot index of the turn node (1e9 all wide, -1 all thin)
+bool     nvEndOk = false;
+int      nvMkKey = -1;
+
+inline float ramp01(float x, float a, float b) { const float t = (x - a) / (b - a); return t < 0.f ? 0.f : (t > 1.f ? 1.f : t); }
+inline float nvLerp(float a, float b, float t) { return a + (b - a) * t; }
+inline bool  nvOn(float x, float y) { return x > -10.f && x < SCREEN_W + 10.f && y > -10.f && y < SCREEN_H + 10.f; }
+inline void  nvDisc(int x, int y, float r, Mode m) { const int ri = (int)lroundf(r); if (ri >= 1) R->ovFillCircle(x, y, ri, m); }
+
+// Middle fraction v (0..1) of the column range [x0, x1): the "squeeze shut / open from the centre" device. Full = no clipping.
+inline bool visWin(int x0, int x1, float v, int& a, int& b) {
+  if (v <= .001f) return false;
+  if (v >= .999f) { a = 0; b = SCREEN_W; return true; }
+  const float c = (x0 + x1) * .5f, hw = (x1 - x0) * .5f * v;
+  a = (int)lroundf(c - hw); b = (int)lroundf(c + hw);
+  return b > a;
+}
+// Rect clipped to the screen top (the banner slides in from above) and to the columns [x0, x1).
+inline void rectY(int x, int y, int w, int h, int x0, int x1, Mode m) {
+  if (y < 0) { h += y; y = 0; }
+  if (h > 0) rectC(x, y, w, h, x0, x1, m);
+}
+
+// Called once from initRest(), after buildTrail(): the idle dots from START to the pin, on the same 14 px grid idle uses.
+void nvBuildDots() {
+  float dd;
+  trailAt(trParkS, nvSX, nvSY, nvDeg0);
+  nvSX = (float)lroundf(nvSX); nvSY = (float)lroundf(nvSY);
+  const float s0 = ceilf(trParkS / TR_DOT_GAP) * TR_DOT_GAP;
+  nvN = 0;
+  for (float s = s0; s < trPinS - 3.f && nvN < NV_MAX - 1; s += TR_DOT_GAP) { trailAt(s, nvAX[nvN], nvAY[nvN], dd); nvN++; }
+  trailAt(trPinS, nvAX[nvN], nvAY[nvN], dd); nvN++;          // the last point is the pin's tip: it becomes the route's end
+  nvLead = (s0 - trParkS) * NV_KEND;
+}
+
+void nvBegin(bool entering) {
+  nvActive = nvPending = true;
+  nvIn = entering;
+  nvMkKey = -1;
+  if (entering) nvBob = (int)lroundf(tri(millis() - ipBobT, 1800) * 6.f);
+}
+
+// The transition is over and idle takes the screen: the pin starts at rest. Without a link, idle resumes as after a link drop.
+void nvLand(uint32_t now) {
+  ipBobT = now;
+  if (nvConn) return;                                        // connected: ipFresh gives the parked marker with the START ring grown
+  ipFresh = false; ipConn = false; ipPh = IP_ACCEL; ipParkT = 0.f; ipBoost = 1.f; ipRing0 = 0.f;
+  ipS = trParkS; ipTrimS = trParkS; ipTrimE = trPinS;        // the road regrows from here while the marker accelerates
+  ipLostMs = now ? now : 1; ipLast = now;
+}
+
+// Lay the idle dots on the route: resample nvS by arc length, starting nvLead px ahead of the marker (where the first idle dot is).
+void nvLayRoute() {
+  float qx[NV_RS], qy[NV_RS], qc[NV_RS];
+  int qn = 0;
+  const bool have = nvS.n >= 2;
+  if (have) { qn = nvS.n; for (int i = 0; i < qn; i++) { qx[i] = nvS.rx[i]; qy[i] = nvS.ry[i]; } }
+  else      { qx[0] = ANCHOR_X; qy[0] = ANCHOR_Y; qx[1] = ANCHOR_X; qy[1] = ANCHOR_Y - 420.f; qn = 2; }   // no route yet: straight ahead
+  qc[0] = 0.f;
+  for (int i = 1; i < qn; i++) qc[i] = qc[i - 1] + hypotf(qx[i] - qx[i - 1], qy[i] - qy[i - 1]);
+  const float L = qc[qn - 1], s0 = fminf(nvLead, L * .5f);
+  int i = 0;
+  for (int j = 0; j < nvN; j++) {
+    const float s = s0 + (L - s0) * (nvN > 1 ? (float)j / (float)(nvN - 1) : 0.f);
+    while (i < qn - 2 && qc[i + 1] < s) i++;
+    const float seg = qc[i + 1] - qc[i], u = seg > 1e-3f ? (s - qc[i]) / seg : 0.f;
+    nvBX[j] = nvLerp(qx[i], qx[i + 1], u);
+    nvBY[j] = nvLerp(qy[i], qy[i + 1], u);
+  }
+  nvEndOk = have && nvS.endOk;
+  const int mode = have ? nvS.nodeMode : 0;
+  if (mode == 1 && L > s0 + 1.f) nvNodeF = (nvS.nodeArc - s0) / (L - s0) * (float)(nvN - 1);
+  else                           nvNodeF = mode == 2 ? -1.f : 1e9f;
+}
+
+struct NvPose { float g, mx, my, mdeg, nx, ny; bool node; };
+
+// p: 0 = the idle road, 1 = the nav route. Swing = rigid rotation about the marker; reshape = dot-wise blend onto the route.
+NvPose nvMorph(float p) {
+  const float q = easeIO(ramp01(p, 0.f, .62f)), m = easeIO(ramp01(p, .38f, 1.f)), k = 1.f - .2f * q;
+  const float phi = -nvDeg0 * q * 0.017453292f, c = cosf(phi), sn = sinf(phi);
+  const float px = nvLerp(nvSX, (float)ANCHOR_X, q), py = nvLerp(nvSY, (float)ANCHOR_Y, q);
+  for (int i = 0; i < nvN; i++) {
+    const float vx = (nvAX[i] - nvSX) * k, vy = (nvAY[i] - nvSY) * k;
+    nvPX[i] = nvLerp(px + vx * c - vy * sn, nvBX[i], m);
+    nvPY[i] = nvLerp(py + vx * sn + vy * c, nvBY[i], m);
+  }
+  NvPose o;
+  o.g = ramp01(p, .12f, .70f);
+  o.mx = nvLerp(px, (float)ANCHOR_X, m); o.my = nvLerp(py, (float)ANCHOR_Y, m);
+  o.mdeg = nvLerp(nvDeg0 * (1.f - q), 0.f, m);
+  o.node = nvNodeF >= 0.f && nvNodeF <= (float)(nvN - 1);
+  int fl = (int)floorf(o.node ? nvNodeF : 0.f);
+  if (fl > nvN - 2) fl = nvN - 2;
+  const float fr = o.node ? nvNodeF - (float)fl : 0.f;
+  o.nx = nvLerp(nvPX[fl], nvPX[fl + 1], fr); o.ny = nvLerp(nvPY[fl], nvPY[fl + 1], fr);
+  return o;
+}
+
+// The road as it turns into the route: dots swell into dashes, then one line, 10 px up to the node and 6 px after it.
+void nvRoute(const NvPose& M) {
+  const float fr = easeOut(M.g);
+  for (int i = 0; i < nvN; i++) {
+    const float w = nvLerp(4.f, ((float)i < nvNodeF) ? 10.f : 6.f, fr);
+    const float x = nvPX[i], y = nvPY[i];
+    const int r = (int)lroundf(w * .5f);
+    if (nvOn(x, y)) R->ovFillCircle((int)lroundf(x), (int)lroundf(y), r < 1 ? 1 : r, M_SET);
+    if (i < nvN - 1 && M.g > .02f) {
+      float x0 = x, y0 = y, x1 = nvLerp(x, nvPX[i + 1], M.g), y1 = nvLerp(y, nvPY[i + 1], M.g);
+      if (clipLine(x0, y0, x1, y1, -8.f, -8.f, SCREEN_W + 7.f, SCREEN_H + 7.f))
+        R->ovLine((int)lroundf(x0), (int)lroundf(y0), (int)lroundf(x1), (int)lroundf(y1), (int)lroundf(w), M_SET);
+    }
+  }
+}
+
+// The marker between its two looks: s = 0 idle (black disc, kite), s = 1 nav (ring, halo, smaller disc, chevron).
+void emitMorphMarker(float fx, float fy, float deg, float s) {
+  const int cx = (int)lroundf(fx), cy = (int)lroundf(fy);
+  const int qd = (int)lroundf(deg / 6.f), qs = (int)lroundf(s * 8.f);
+  const int key = (qd + 100) * 16 + qs;
+  if (key != nvMkKey) {
+    nvMkKey = key;
+    static const float K0[4][2] = {{0, -10}, {8, 11}, {0, 6}, {-8, 11}};
+    static const float K1[4][2] = {{0, -12}, {9, 7}, {0, 1}, {-9, 7}};
+    const float a = qd * 6.f * 0.017453292f, ca = cosf(a), sa = sinf(a), t = (float)qs / 8.f;
+    int X[4], Y[4];
+    for (int i = 0; i < 4; i++) {
+      const float kx = nvLerp(K0[i][0], K1[i][0], t), ky = nvLerp(K0[i][1], K1[i][1], t);
+      X[i] = lroundf(14 + kx * ca - ky * sa); Y[i] = lroundf(14 + kx * sa + ky * ca);
+    }
+    spMorph->fillSprite(0);
+    spMorph->fillTriangle(X[0], Y[0], X[1], Y[1], X[2], Y[2], 1);
+    spMorph->fillTriangle(X[0], Y[0], X[3], Y[3], X[2], Y[2], 1);
+    R->markDirtyRect(cx - 14, cy - 14, cx + 13, cy + 13);
+  }
+  if (s > .15f) { const int rr = (int)lroundf(17.f + 4.5f * s); R->ovCircle(cx, cy, rr, M_SET); R->ovCircle(cx, cy, rr - 1, M_SET); }
+  if (s > .01f) nvDisc(cx, cy, 17.f + 2.f * s, M_CLR);
+  nvDisc(cx, cy, 17.f - 3.f * s, M_SET);
+  R->ovBitmap(cx - 14, cy - 14, 28, 28, ptr(spMorph), M_CLR);
+}
+
+void nvLimitText(int lim) {                                  // same sprite navFrame() uses in steady state
+  char ls[8];
+  snprintf(ls, sizeof(ls), "%d", lim);
+  if (lim >= 100) setText(tLimit, ls, B17, AL_C, 21); else setText(tLimit, ls, B24, AL_C, 24);
+}
+
+// Status bar between the idle layout (battery left, Bluetooth + version right) and the nav one (speed | heading | battery).
+void nvStatus(const Hud& h, bool conn, float verV, float btV, float batT, float spdV, float dirV) {
+  emitBarFrame();
+  int a, b;
+
+  char pc[12];
+  if (h.battPct < 0) snprintf(pc, sizeof(pc), "--"); else snprintf(pc, sizeof(pc), "%d%%", h.battPct);
+  const int rightX = 460 - (32 + 8 + textW(B14, pc, 0));
+  const int bx = (int)lroundf(nvLerp(20.f, (float)rightX, batT));
+  emitBattery(bx, BOT_Y + 12, h.battPct, h.nowMs);
+  setBattText(h);
+  tBatt.x = bx + (int)lroundf(nvLerp(42.f, 40.f, batT)); tBatt.y = BOT_Y + 7;
+  blit(tBatt, M_SET);
+
+  const char* unitTxt = nvS.imp ? "MPH" : "KM/H";             // speed + unit, then heading (the sprites hold the nav texts)
+  const int wSpd = textW(B24, nvS.sp, 0), wUnit = textW(FB11, unitTxt, 1) + 1;
+  tSpeed.x = 20; tSpeed.y = BOT_Y + 4;
+  tUnit.x = 20 + wSpd + 6; tUnit.y = BOT_Y + 16;
+  const int midL = tUnit.x + wUnit;
+  if (visWin(20, midL, spdV, a, b)) { blitClip(srcOf(tSpeed), a, b, M_SET); blitClip(srcOf(tUnit), a, b, M_SET); }
+  const int wD = textW(FB11, nvS.dir, 2);
+  tDir.x = (midL + rightX) / 2 - wD / 2; tDir.y = BOT_Y + 9;
+  if (visWin(tDir.x, tDir.x + wD, dirV, a, b)) blitClip(srcOf(tDir), a, b, M_SET);
+
+  char v[24]; snprintf(v, sizeof(v), "V%s", FW_VERSION_STRING);   // Bluetooth group slides right as the version retracts, then shuts
+  setText(tBtLbl, "BLUETOOTH", FB11, AL_L, 14, 2);
+  setText(tVerLbl, v, FB11, AL_L, 14, 2);
+  const int wB = textW(FB11, "BLUETOOTH", 2) + 2, wV = textW(FB11, v, 2) + 2;
+  const int verX = 460 - wV, divX = verX - 11;
+  const int cxd = (int)lroundf(nvLerp(455.f, (float)(divX - 15), verV));
+  const int lend = (int)lroundf(nvLerp(440.f, (float)(divX - 30), verV));
+  tBtLbl.x = lend - wB; tBtLbl.y = BOT_Y + 9;
+  if (visWin(tBtLbl.x, cxd + 5, btV, a, b)) {
+    blitClip(srcOf(tBtLbl), a, b, M_SET);
+    if (cxd >= a && cxd < b) emitBtDot(cxd, BOT_Y + 19, conn);
+  }
+  if (verV > .001f) {
+    tVerLbl.x = verX; tVerLbl.y = BOT_Y + 9;
+    blitClip(srcOf(tVerLbl), 460 - (int)lroundf(wV * verV), 460, M_SET);
+    if (verV > .5f) rectC(divX, BOT_Y + 12, 1, 14, 0, SCREEN_W, M_SET);
+  }
+}
+
+// One frame. in = idle -> nav. For nav -> idle (in = false) the data comes from nvS, the last steady nav frame.
+void nvDraw(const Hud& h, float T, bool in) {
+  static const float TI[8] = {0.f, .03f, .06f, .09f, .12f, .15f, .18f, .21f};   // cloud, tree, X, tree, pin, title, hint, pill
+  static const float TO[8] = {.60f, .63f, .66f, .69f, .85f, .72f, .76f, .80f};
+  const float* t0 = in ? TI : TO;
+  auto sv = [&](int i) -> float { const float e = easeOut((T - t0[i]) / .16f); return in ? 1.f - e : e; };   // visible fraction
+  const float p = in ? ramp01(T, .10f, .80f) : 1.f - ramp01(T, .18f, .85f);
+  int a, b;
+
+  nvLayRoute();
+  const NvPose M = nvMorph(p);
+
+  // ---- idle scenery ----
+  if (in || nvConn) { Hud hh = h; hh.connected = true; idleTexts(hh); }
+  else { setText(tStat, "DISCONNECTED", B12, AL_C, 17, 2); setText(tHint, "Connection to phone lost.", S17, AL_L, 18); }
+  if (visWin(276, 332, sv(0), a, b)) blitClip(srcOf(spCloud, 276, 12, 56, 28), a, b, M_SET);
+  if (visWin(86, 114, sv(1), a, b))  blitClip(srcOf(spTreeA, 86, 128, 28, 44), a, b, M_SET);
+  if (visWin(233, 247, sv(2), a, b)) blitClip(srcOf(spXMark, 233, 125, 14, 14), a, b, M_SET);
+  if (visWin(429, 451, sv(3), a, b)) blitClip(srcOf(spTreeB, 429, 186, 22, 36), a, b, M_SET);
+  if (visWin(inkX0(tIdleT), inkX1(tIdleT), sv(5), a, b)) blitClip(srcOf(tIdleT), a, b, M_SET);
+  if (visWin(inkX0(tHint), inkX1(tHint), sv(6), a, b))   blitClip(srcOf(tHint), a, b, M_SET);
+  if (visWin(306, 456, sv(7), a, b)) {
+    blitClip(srcOf(spPill, tStat.x, tStat.y, tStat.w, tStat.h), a, b, M_SET);
+    blitC(tStat, a, b, M_CLR);
+  }
+
+  // ---- trail behind the vehicle (nav) ----
+  for (int k = 1; k <= 14; k++) {
+    const bool on = in ? T > .80f + .012f * k : T < (14 - k) * .012f + .02f;
+    if (on) R->ovFillCircle(ANCHOR_X, ANCHOR_Y + 9 * k, 2, M_SET);
+  }
+
+  // ---- road -> route, pin -> destination ring ----
+  nvRoute(M);
+  const float ex = nvPX[nvN - 1], ey = nvPY[nvN - 1];
+  const int   exi = (int)lroundf(ex), eyi = (int)lroundf(ey);
+  if (visWin(exi - 17, exi + 17, sv(4), a, b)) {
+    const int pinX = exi - 17, pinY = eyi - 46 - (in ? nvBob : 0);
+    blitClip(srcOf(spPin, pinX, pinY, 34, 47), a, b, M_SET);
+    tPinQ.x = pinX + 5; tPinQ.y = pinY + 4;
+    blitC(tPinQ, a, b, M_CLR);
+  }
+  float rs = in ? easeOut(ramp01(T, .24f, .40f)) : 1.f - easeOut(ramp01(T, .70f, .85f));
+  if (!nvEndOk) rs *= 1.f - ramp01(p, .6f, 1.f);             // the real end is off screen: the ring leaves with the route
+  if (rs > .01f && nvOn(ex, ey)) {
+    nvDisc(exi, eyi, 18.f * rs, M_SET); nvDisc(exi, eyi, 13.f * rs, M_CLR); nvDisc(exi, eyi, 7.f * rs, M_SET);
+  }
+  const float ns = easeOut(ramp01(p, .85f, 1.f));
+  if (M.node && ns > .01f && nvOn(M.nx, M.ny)) {
+    const int nx = (int)lroundf(M.nx), ny = (int)lroundf(M.ny);
+    nvDisc(nx, ny, 12.f * ns, M_SET); nvDisc(nx, ny, 8.f * ns, M_CLR); nvDisc(nx, ny, 3.f * ns, M_SET);
+  }
+
+  // ---- marker ----
+  const float ms = easeOut(ramp01(p, .72f, 1.f));
+  if (!in && !nvConn && ms < .5f) emitTrailMarkerHollow((int)lroundf(M.mx), (int)lroundf(M.my));
+  else                            emitMorphMarker(M.mx, M.my, M.mdeg, ms);
+
+  // ---- START ring ----
+  float rr = 0.f; bool lab = false;
+  if (in) { const float c1 = easeOut(ramp01(T, 0.f, .2f)); rr = 26.f * (1.f - c1); lab = c1 < .3f; }
+  else if (nvConn && T >= 1.f) { const float e2 = easeOut(ramp01(T, 1.f, 1.25f)); rr = 18.f + 8.f * e2; lab = e2 >= .5f; }
+  if (rr >= 3.f) {
+    const int ri = (int)lroundf(rr), cx = (int)lroundf(nvSX), cy = (int)lroundf(nvSY);
+    R->ovCircle(cx, cy, ri, M_SET); R->ovCircle(cx, cy, ri - 1, M_SET); R->ovCircle(cx, cy, ri - 2, M_SET);
+    if (lab) blit(tStartL, M_SET);
+  }
+
+  // ---- speed limit sign ----
+  const float lv = in ? easeOut(ramp01(T, 1.05f, 1.28f)) : 1.f - easeOut(ramp01(T, 0.f, .18f));
+  if (nvS.limit > 0 && lv > .01f) {
+    const int lx = SCREEN_W - 14 - 34, ly = BOT_Y - 8 - 34;
+    nvDisc(lx, ly, 36.f * lv, M_CLR); nvDisc(lx, ly, 33.f * lv, M_SET); nvDisc(lx, ly, 25.f * lv, M_CLR);
+    tLimit.x = lx - tLimit.w / 2; tLimit.y = ly - tLimit.h / 2;
+    if (visWin(lx - 32, lx + 32, lv, a, b)) blitClip(srcOf(tLimit), a, b, M_SET);
+  }
+
+  // ---- banner ----
+  int oy, ix; float vI, vD, vS, vC, vR;
+  if (in) {
+    oy = (int)lroundf(-BAN_H * (1.f - easeOut(ramp01(T, .45f, .80f))));
+    ix = (int)lroundf(16.f - 96.f * (1.f - easeOut(ramp01(T, .70f, .95f))));
+    vI = 1.f;
+    vD = easeOut(ramp01(T, .80f, 1.f));   vS = easeOut(ramp01(T, .88f, 1.08f));
+    vC = easeOut(ramp01(T, 1.f, 1.18f));  vR = easeOut(ramp01(T, .95f, 1.2f));
+  } else {
+    oy = (int)lroundf(-BAN_H * easeIO(ramp01(T, .22f, .52f)));
+    ix = 16;
+    vI = 1.f - easeOut(ramp01(T, .12f, .28f)); vD = 1.f - easeOut(ramp01(T, .08f, .26f));
+    vS = 1.f - easeOut(ramp01(T, .04f, .22f)); vC = 1.f - easeOut(ramp01(T, 0.f, .18f));
+    vR = 1.f - easeOut(ramp01(T, .10f, .26f));
+  }
+  if (oy > -BAN_H) {
+    R->ovFillRect(0, 0, SCREEN_W, oy + BAN_H, M_SET);
+    TFT_eSprite* ics = nvS.bmode == 2 ? spIcon[10] : (nvS.bmode == 1 ? spSpin[0] : spIcon[nvS.icon]);
+    if (visWin(16, 16 + IC, vI, a, b)) blitClip(srcOf(ics, ix, 12, IC, IC), a, b, M_CLR, oy);
+    const TextSpr& big = nvS.bmode ? tBig : tDist;
+    if (visWin(inkX0(big), inkX1(big), vD, a, b))       blitClip(srcOf(big), a, b, M_CLR, oy);
+    if (visWin(inkX0(tStreet), inkX1(tStreet), vS, a, b)) blitClip(srcOf(tStreet), a, b, M_CLR, oy);
+    if (visWin(416, 460, vC, a, b))
+      blitClip(srcOf(nvS.bmode == 2 ? spCheck : spCompass, 416, 20, 44, 44), a, b, M_CLR, oy);
+    if (visWin(16, SCREEN_W - 16, vR, a, b)) {
+      rectY(16, BAN_H - 8 + oy, SCREEN_W - 32, 1, a, b, M_CLR);
+      const int fw = (int)lroundf((SCREEN_W - 32) * nvS.bar);
+      if (fw > 0) rectY(16, BAN_H - 9 + oy, fw, 3, a, b, M_CLR);
+    }
+  }
+
+  // ---- status bar ----
+  if (in) nvStatus(h, true, 1.f - easeOut(ramp01(T, 0.f, .25f)), 1.f - easeOut(ramp01(T, .18f, .40f)),
+                   easeIO(ramp01(T, .30f, .65f)), easeOut(ramp01(T, .58f, .80f)), easeOut(ramp01(T, .66f, .88f)));
+  else    nvStatus(h, nvConn, easeOut(ramp01(T, .75f, 1.f)), easeOut(ramp01(T, .55f, .80f)),
+                   1.f - easeIO(ramp01(T, .30f, .65f)), 1.f - easeOut(ramp01(T, 0.f, .18f)), 1.f - easeOut(ramp01(T, 0.f, .18f)));
+}
+
 }  // namespace
 
 // =============================================================================================
@@ -862,7 +2214,7 @@ void initBoot(TFT_eSPI* t, Renderer* r) {
   mk(tBootT, 0, 150, SCREEN_W, 56);
   mk(tBootL, 0, 256, SCREEN_W, 18);
   mk(tBootV, 0, 292, SCREEN_W, 18);
-  setText(tBootT, "TahVia", B42, AL_C, 40, -1);
+  setText(tBootT, "CubiNav", B42, AL_C, 40, -1);
   char v[24]; snprintf(v, sizeof(v), "V%s", FW_VERSION_STRING);
   setText(tBootV, v, FB11, AL_C, 13, 2);
 }
@@ -930,10 +2282,13 @@ bool bootAnimDone() {
 void initRest() {
   buildLogo(spLogoSmall, LOGO_SMALL);
   // idle
-  mk(tIdleT, 0, 164, SCREEN_W, 44);
-  mk(tStat, 0, 214, SCREEN_W, 22);
-  mk(tHint, 0, 240, SCREEN_W, 24);
-  setText(tIdleT, "TahVia", B32, AL_C, 32, -1);
+  mk(tIdleT, 28, 12, 230, 52);                               // idle: title, subtitle, status pill (see "Idle: the trail")
+  mk(tStat, 306, 237, 150, 26);
+  mk(tHint, 28, 60, 340, 24);
+  setText(tIdleT, "CubiNav", B42, AL_L, 40, -1);
+  buildTrail();
+  buildIdleArt();
+  nvBuildDots();                                             // idle <-> nav transition: the road's dots START -> pin
   // pairing
   mk(tPTitle, 54, 16, 100, 26);
   mk(tPTag, 340, 22, 120, 14);
@@ -941,7 +2296,7 @@ void initRest() {
   mk(tPDig, 56, 108, 368, 68);
   mk(tPH1, 0, 206, SCREEN_W, 24);
   mk(tPH2, 0, 234, SCREEN_W, 20);
-  setText(tPTitle, "TahVia", B17, AL_L, 19);
+  setText(tPTitle, "CubiNav", B17, AL_L, 19);
   setText(tPTag, "PAIRING", FB11, AL_R, 11, 2, 2);
   setText(tPLbl, "PAIRING CODE", B12, AL_C, 14, 2);
   // status bar
@@ -1014,115 +2369,100 @@ void bootBar(int pct) {
 // Runtime screens
 // =============================================================================================
 void enter(Screen s) {
+  static uint8_t prev = 255;                                // screen shown before this call
+  const bool fromIdle = prev == SCR_IDLE, fromUpdate = prev == SCR_UPDATE, fromNav = prev == SCR_NAV;
+  const bool navSteady = nvS.valid;                         // the last nav frame was a complete one (not the entry transition)
+  nvS.valid = false;
+  prev = s;
+  const bool otWasRunning = otActive;                       // still building the update screen
+  const bool erWasRunning = erActive;                       // still building the failure screen
+  (void)fromUpdate; (void)otWasRunning; (void)erWasRunning; (void)fromNav; (void)navSteady;
   R->baseClear(M_CLR);
   keyValid = false;
   turnOk = false; turnWait = false; odoOk = false;
   compQ = chevQ = -999;
-  revealPending = true;
-  if (s == SCR_UPDATE) {                                    // static ruler under the progress bar
-    R->baseFillRect(49, 182, 382, 2, M_SET);
-    for (int i = 0; i <= 20; i++) R->baseFillRect(49 + i * 19, 186, 2, 8, M_SET);
-    for (int i = 0; i < 5; i++)   R->baseFillRect(49 + i * 95, 186, 2, 14, M_SET);
-  }
+  otActive = otPending = false;
+  nvActive = nvPending = false;
+  cxActive = cxPending = cxFail = false;
+  erActive = erPending = false;
+#if UI_ANIMATIONS && UI_OTA_TRANSITION
+  // Idle -> update: the road turns into the ruler (needs the idle state, so before ipFresh is reset). Not from the pairing screen.
+  if (s == SCR_UPDATE && fromIdle && !ipFresh && ptMode == PTR_NONE && !ptPrev) otBegin();
+#else
+  (void)fromIdle;
+#endif
+#if UI_ANIMATIONS && UI_OTA_CANCEL_TRANSITION
+  // Update -> idle after a cancel: drain, hold, sweep (see "Update cancelled -> idle"). Needs the last live update frame.
+  if (s == SCR_IDLE && fromUpdate && upLive && !otWasRunning) cxActive = cxPending = true;
+#endif
+#if UI_ANIMATIONS && UI_OTA_FAIL_TRANSITION
+  // Failure screen -> idle: it closes, then the damaged marker sweeps the idle screen back in.
+  if (s == SCR_IDLE && fromUpdate && upFailed && !erWasRunning) { cxActive = cxPending = true; cxFail = true; }
+#endif
+#if UI_ANIMATIONS && UI_NAV_TRANSITION
+  // Idle -> nav: the road becomes the route. Only from a settled idle screen (not fresh, not pairing), else the curtain wipe.
+  if (s == SCR_NAV && fromIdle && !ipFresh && ptMode == PTR_NONE && !ptPrev) nvBegin(true);
+  // Nav -> idle: the route lets go of the screen. Needs the last steady nav frame (nvS).
+  if (s == SCR_IDLE && fromNav && navSteady) nvBegin(false);
+#endif
+  upLive = upShown = upSteady = upFailed = false;
+  ipFresh = true;                                           // idle: no transition replay when the screen is (re)entered
+  ptFresh = true; ptMode = PTR_NONE;                         // same for the idle <-> pairing transition
+  revealPending = !otActive && !cxActive && !nvActive;       // the OTA, cancel and nav transitions replace the curtain wipe
+  if (s == SCR_UPDATE && !otActive) updateRuler();           // static ruler under the progress bar
+}
+
+bool transitionBusy(uint32_t nowMs) {
+  return otActive || cxActive || nvActive || revealPending || (uint32_t)(nowMs - revealStart) < REVEAL_MS;
 }
 
 // ---- Idle / pairing -------------------------------------------------------------------
 void idleFrame(const Hud& h) {
   const uint32_t now = h.nowMs;
-  char stat[48], hint[56];
 
   R->overlayBegin();
+  clipBegin();
 
-  if (h.pairing) {
-    unsigned long pk = (unsigned long)(h.passkey % 1000000UL);
-    char d[8]; snprintf(d, sizeof(d), "%06lu", pk);
-    if (begin(tPDig, d)) {                                   // six digits, each centred in a 52 px box
-      static const int CX[6] = {26, 86, 146, 222, 282, 342};
-      for (int i = 0; i < 6; i++) {
-        char one[2] = {d[i], 0};
-        put(tPDig, D64, one, CX[i] - textW(D64, one, 0) / 2, 55, 0);
-      }
-      finish(tPDig);
-    }
-    setText(tPH1, "Enter this code on your phone", S17, AL_C, 19);
-    setText(tPH2, "The code is new every time you connect.", M14, AL_C, 16);
-
-    R->ovBitmap(20, 16, LOGO_SMALL, LOGO_SMALL, ptr(spLogoSmall), M_SET);
-    blit(tPTitle, M_SET);
-    blit(tPTag, M_SET);
-    blit(tPLbl, M_SET);
-    blit(tPDig, M_SET);
-    static const int UX[6] = {56, 116, 176, 252, 312, 372};
-    for (int i = 0; i < 6; i++) R->ovFillRect(UX[i], 178, 52, 4, M_SET);
-    blit(tPH1, M_SET);
-    blit(tPH2, M_SET);
-  } else {
-    const int LCX = 240, LCY = 84;
-    if (!h.connected) {
-      static const char* DOTS[4] = {"", ".", "..", "..."};
-#if UI_ANIMATIONS
-      const char* dots = DOTS[(now / 350) & 3];
-#else
-      const char* dots = DOTS[3];
-#endif
-      snprintf(stat, sizeof(stat), "WAITING FOR PHONE%s", dots);
-      if (begin(tStat, stat)) {                              // left aligned at the position of the full text
-        int w = textW(B12, "WAITING FOR PHONE...", 2);
-        put(tStat, B12, stat, (SCREEN_W - w) / 2, 16, 2);
-        finish(tStat);
-      }
-      snprintf(hint, sizeof(hint), "Open TahviaNav and connect to TahVia");
-      for (int i = 0; i < 3; i++) {                          // searching: rings contract and fade in 8 steps
-        uint32_t ph = (now + 2400 * 4 - 800 * i) % 2400;
-        int step = (int)(ph * 8 / 2400);
-        if (step > 4) continue;
-        int rr = lroundf(80 * (0.78f + 0.22f * step / 8.f));
-        R->ovCircle(LCX, LCY, rr, M_SET);
-        R->ovCircle(LCX, LCY, rr - 1, M_SET);
-      }
-    } else {
-      snprintf(stat, sizeof(stat), "PHONE CONNECTED");
-      setText(tStat, stat, B12, AL_C, 16, 2);
-      snprintf(hint, sizeof(hint), "No route yet. Pick a destination in the app.");
-      R->ovCircle(LCX, LCY, 56, M_SET);
-      R->ovCircle(LCX, LCY, 55, M_SET);
-    }
-    setText(tHint, hint, M15, AL_C, 19);
-    R->ovBitmap(196, 40, LOGO_BIG, LOGO_BIG, ptr(spLogoBig), M_SET);
-    blit(tIdleT, M_SET);
-    blit(tStat, M_SET);
-    blit(tHint, M_SET);
-
-#if UI_ANIMATIONS
-    static bool wasLinked = false, burstOn = false;
-    static uint32_t linkT = 0;
-    bool linked = h.connected;
-    if (linked != wasLinked) { wasLinked = linked; linkT = now; burstOn = true; }
-    uint32_t el = now - linkT;
-    if (burstOn) {
-      if (el >= BURST_MS) burstOn = false;
-      else {
-        float e = easeOut(el / (float)BURST_MS);
-        int r = linked ? 58 + (int)(e * 90) : 148 - (int)(e * 90);
-        R->ovCircle(LCX, LCY, r, M_SET);
-        R->ovCircle(LCX, LCY, r + 1, M_SET);
-      }
-    }
-    int rb = linked ? (el < POP_MS ? (int)(14 * easeOut(el / (float)POP_MS)) : 14) : 0;
-#else
-    int rb = h.connected ? 14 : 0;
-#endif
-    if (rb > 0) {                                            // check badge on the logo
-      const int bx = 274, by = 118;
-      R->ovFillCircle(bx, by, rb + 4, M_CLR);
-      R->ovFillCircle(bx, by, rb, M_SET);
-      if (rb >= 11) {
-        R->ovLine(bx - 5, by + 1, bx - 1, by + 4, 3, M_CLR);
-        R->ovLine(bx - 1, by + 4, bx + 5, by - 4, 3, M_CLR);
-      }
-    }
+  if (h.pairing) snprintf(ptCode, sizeof(ptCode), "%06lu", (unsigned long)(h.passkey % 1000000UL));
+  float cxT = 0.f;
+#if UI_ANIMATIONS && UI_OTA_CANCEL_TRANSITION
+  if (cxActive) {
+    if (cxPending) { cxPending = false; cxStart = now; idleReset(now); }   // idle restarts from a calm SEARCHING behind the bar
+    cxT = (float)trElapsed(now, cxStart, cxFail ? (float)UI_OTA_FAIL_EXIT_SPEED_DIV : (float)UI_OTA_CANCEL_SPEED_DIV) * 1e-3f;
+    if (cxT >= cxEnd()) { cxActive = false; ipBobT = now; }                  // idle takes over, the pin starts at rest
   }
-  emitStatusBar(h, true);
+#endif
+  float nvT = 0.f;
+#if UI_ANIMATIONS && UI_NAV_TRANSITION
+  if (nvActive && !nvIn) {                                   // nav -> idle: the route lets go of the screen
+    if (nvPending) { nvPending = false; nvStart = now; nvConn = h.connected; }
+    nvT = (float)trElapsed(now, nvStart, (float)UI_NAV_EXIT_SPEED_DIV) * 1e-3f;
+    if (nvT >= NV_END) { nvActive = false; nvLand(now); }    // idle takes over this very frame
+  }
+#endif
+  if (!cxActive && !nvActive) pairTrUpdate(h);
+
+  if (nvActive && !nvIn) {
+    ipLast = now;                                            // the idle sim is frozen during a transition
+    nvDraw(h, nvT, false);
+  } else if (cxActive) {
+    ipLast = now;                                            // the idle sim is frozen during a transition
+    cxDraw(h, cxT);
+  } else if (ptMode == PTR_IN) {
+    ipLast = now;                                            // the idle sim is frozen during a transition
+    transIn(h, trElapsed(now, ptStart, (float)UI_PAIR_SPEED_DIV));
+  } else if (ptMode == PTR_OUT) {
+    ipLast = now;
+    transOut(h, trElapsed(now, ptStart, (float)UI_PAIR_SPEED_DIV));
+  } else if (h.pairing) {
+    pairDraw(ptCode, 99.f, false, 0, SCREEN_W);              // steady pairing screen
+    emitStatusBar(h, true);
+  } else {
+    idleTexts(h);                                            // before idleUpdate(): see idleLostText()
+    idleUpdate(h);
+    idleScene(h, 0, SCREEN_W, true);
+    emitStatusBar(h, true);
+  }
   emitFps(h, h.showFps, 140, 264, false);
   emitReveal(now);
 }
@@ -1185,6 +2525,38 @@ void navFrame(NavModel& m, const Hud& h) {
   barShown += (barTarget - barShown) * 0.25f;
   if (fabsf(barTarget - barShown) < 0.004f) barShown = barTarget;
 
+  // What the screen shows, for the nav -> idle transition (nvS), and the live target of the idle -> nav one.
+  nvS.icon = m.icon <= 10 ? m.icon : 0;
+  nvS.bmode = arrived ? 2 : (rerouting ? 1 : 0);
+  nvS.bar = barShown;
+  nvS.imp = cfg.imperial;
+  strncpy(nvS.sp, sp, sizeof(nvS.sp) - 1);          nvS.sp[sizeof(nvS.sp) - 1] = 0;
+  strncpy(nvS.dir, dirTxt, sizeof(nvS.dir) - 1);    nvS.dir[sizeof(nvS.dir) - 1] = 0;
+  int limShown = 0;                                          // posted limit in the displayed unit (see the sign below)
+  if (m.speedLimitKmh > 0 && !arrived) {
+    limShown = m.speedLimitKmh;
+    if (cfg.imperial) limShown = (int)(limShown / 1.609344f / 5.f + 0.5f) * 5;
+  }
+  nvS.limit = limShown;
+
+#if UI_ANIMATIONS && UI_NAV_TRANSITION
+  if (nvActive && nvIn) {                                    // idle -> nav: the road becomes the route (BASE stays blank meanwhile)
+    if (nvPending) { nvPending = false; nvStart = now; }
+    const float tt = (float)trElapsed(now, nvStart, (float)UI_NAV_SPEED_DIV) * 1e-3f;
+    if (tt >= NV_END) nvActive = false;                      // the map takes over this very frame
+    else {
+      if (fix) drawRoute(m, theta, scale, arrived, false);   // project only: the target follows the vehicle
+      else     nvS.n = 0;
+      if (limShown > 0) nvLimitText(limShown);
+      if (!arrived) updateCompass(theta, 416, 20);
+      R->overlayBegin();
+      clipBegin();
+      nvDraw(h, tt, true);
+      return;
+    }
+  }
+#endif
+
   // ---- BASE: map. Redrawn only when the quantized view changed, at most every UI_MAP_MIN_MS ----
   ViewKey k; memset(&k, 0, sizeof(k));
   k.qx = (int32_t)lround(m.pose.x() * scale * (0.1 / UI_MAP_POS_Q_PX));     // 1 dm = scale*0.1 px
@@ -1201,6 +2573,7 @@ void navFrame(NavModel& m, const Hud& h) {
     mapIx = (int32_t)lround(m.pose.x()); mapIy = (int32_t)lround(m.pose.y());   // same rounding as drawRoute
     mapTheta = theta; mapScale = scale; mapOk = fix;
     clearMap();
+    nvS.n = 0;
     if (fix) drawRoute(m, theta, scale, arrived);
   }
 
@@ -1300,6 +2673,7 @@ void navFrame(NavModel& m, const Hud& h) {
 
   emitFps(h, cfg.showFps, 8, 134, true);
   emitReveal(now);
+  nvS.valid = true;                                          // a steady nav frame: enter(SCR_IDLE) may play the exit from it
 }
 
 // =============================================================================================
@@ -1312,11 +2686,43 @@ void updateFrame(const ota::Info& o, const Hud& h) {
   int pct = o.total ? (int)(((uint64_t)o.done * 100) / o.total) : 0;
   if (done) pct = 100;
   if (pct > 100) pct = 100;
+  upPct = pct; upDone = o.done; upTotal = o.total; upVer = o.version;   // what a cancel transition starts from
+  upLive = !err && !done && !ver;
+  const bool prevShown = upShown && upSteady;               // the previous frame showed the complete progress screen
+  upShown = !err && !done; upFailed = err;
+  if (err) upErr = o.err;
+
+  // Idle -> update transition clock: tt = scaled seconds (99 = steady screen). An error ends it at once.
+  float tt = 99.f;
+  if (otActive) {
+    if (otPending) { otPending = false; otStart = h.nowMs; }
+    tt = (float)trElapsed(h.nowMs, otStart, (float)UI_OTA_SPEED_DIV) * 1e-3f;
+    if (err || tt >= OT_END) { otActive = false; tt = 99.f; updateRuler(); }   // ruler moves into BASE (same pixels)
+  }
+  const bool trans = tt < OT_END;
+  upSteady = !trans;
+
+  // Update -> failed transition clock: ft = scaled seconds (99 = steady failure screen).
+  float ft = 99.f;
+#if UI_ANIMATIONS && UI_OTA_FAIL_TRANSITION
+  if (err && prevShown && !erActive) erActive = erPending = true;
+  if (erActive) {
+    if (erPending) { erPending = false; erStart = h.nowMs; }
+    ft = (float)trElapsed(h.nowMs, erStart, (float)UI_OTA_FAIL_SPEED_DIV) * 1e-3f;
+    if (ft >= FT_END) { erActive = false; ft = 99.f; }
+  }
+#else
+  (void)prevShown;
+#endif
 
   R->overlayBegin();
-  blit(tUpLbl, M_SET);
+  clipBegin();
+  if (trans) otIdleLayer(h, tt);
+  { int a, b; if (openWin(240, 110, (tt - 1.05f) / .25f, a, b)) blitClip(srcOf(tUpLbl), a, b, M_SET); }
 
-  if (err) {
+  if (err && ft < FT_END) {
+    failBuild(ft);                                           // progress screen closes, failure screen opens
+  } else if (err) {
     setText(tFailE, ota::errorText(o.err), S19, AL_C, 21);
     setText(tFailH, "Old firmware kept. Try again in the app.", M14, AL_C, 14);
     R->ovFillRect(49, 172, 382, 30, M_CLR);                  // hide the ruler
@@ -1328,32 +2734,46 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     blit(tFailH, M_SET);
   } else {
     char b[48];
-    snprintf(b, sizeof(b), "%d", pct);
-    if (begin(tUpPct, b)) {                                  // huge percent
-      int wD = textW(D104, b, -4), wP = textW(P40, "%", 0);
-      int x = (tUpPct.w - (wD + 6 + wP)) / 2;
-      int e = put(tUpPct, D104, b, x, 84, -4);
-      put(tUpPct, P40, "%", e + 6 + 4, 84, 0);               // +4: undo the trailing negative tracking
-      finish(tUpPct);
+    if (trans) {                                             // the ruler is drawn here until it moves into BASE
+      const int rw = (int)lroundf(OT_RW * easeOut((tt - 1.f) / .25f));
+      if (rw > 0) R->ovFillRect(240 - rw / 2, OT_RY, rw, 2, M_SET);
+      for (int i = 0; i <= 20; i++) {
+        const int th = (int)lroundf((i % 5 ? 8 : 14) * easeOut((tt - 1.1f - i * .012f) / .12f));
+        if (th > 0) R->ovFillRect(OT_RX + i * 19, 186, 2, th, M_SET);
+      }
     }
-    blit(tUpPct, M_SET);
+    if (tt >= 1.15f) {                                       // huge percent: one roll, then it locks with a 3 px bump
+      int dy = 0;
+      if (tt < 1.29f) {
+        snprintf(b, sizeof(b), "%d", (int)(((long)(tt * 25.f) * 7) % 10));
+        renderPct(b, false);
+      } else {
+        snprintf(b, sizeof(b), "%d", pct);
+        renderPct(b, true);
+        if (tt < 1.37f) dy = -(int)lroundf(3.f * (1.f - (tt - 1.29f) / .08f));
+      }
+      blitClip(srcOf(tUpPct), 0, SCREEN_W, M_SET, dy);
+    }
 
     int fw = 382 * pct / 100;
-    if (ver) {                                               // verifying: indeterminate sweep
-      int sx = (int)(tri(h.nowMs, 1200) * (382 - 80));
-      R->ovFillRect(49 + sx, 172, 80, 10, M_SET);
-    } else if (fw > 0) {
-      R->ovFillRect(49, 172, fw, 10, M_SET);
+    if (tt >= 1.f) {
+      if (ver) {                                             // verifying: indeterminate sweep
+        int sx = (int)(tri(h.nowMs, 1200) * (382 - 80));
+        R->ovFillRect(49 + sx, 172, 80, 10, M_SET);
+      } else if (fw > 0) {
+        R->ovFillRect(49, 172, fw, 10, M_SET);
+      }
     }
 
+    int wa, wb;
     snprintf(b, sizeof(b), "%lu / %lu KB", (unsigned long)((o.done + 512) / 1024), (unsigned long)((o.total + 512) / 1024));
     setText(tUpKB, b, B14, AL_L, 16);
-    blit(tUpKB, M_SET);
+    if (openWin(150, 110, (tt - 1.35f) / .2f, wa, wb)) blitClip(srcOf(tUpKB), wa, wb, M_SET);
     snprintf(b, sizeof(b), "%u.%u.%u -> %u.%u.%u",
              (unsigned)FW_V_MAJOR(FW_VERSION), (unsigned)FW_V_MINOR(FW_VERSION), (unsigned)FW_V_PATCH(FW_VERSION),
              (unsigned)FW_V_MAJOR(o.version),  (unsigned)FW_V_MINOR(o.version),  (unsigned)FW_V_PATCH(o.version));
     setText(tUpVer, b, FB11, AL_R, 14, 2, 2);
-    blit(tUpVer, M_SET);
+    if (openWin(340, 100, (tt - 1.35f) / .2f, wa, wb)) blitClip(srcOf(tUpVer), wa, wb, M_SET);
 
     const char* msg = done ? "Restarting..." : ver ? "Verifying..." : "Keep the app open. Do not power off.";
     setText(tUpHint, msg, S14, AL_L, 16);
@@ -1361,12 +2781,16 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     const int tw = textW(S14, msg, 0);
     const int total = (lock ? 22 : 0) + tw;
     const int x0 = (SCREEN_W - total) / 2;
-    if (lock) R->ovBitmap(x0, 245, 14, 16, ptr(spLock), M_SET);
     tUpHint.x = x0 + (lock ? 22 : 0);
-    blit(tUpHint, M_SET);
+    if (openWin(240, 170, (tt - 1.55f) / .25f, wa, wb)) {
+      if (lock) blitClip(srcOf(spLock, x0, 245, 14, 16), wa, wb, M_SET);
+      blitClip(srcOf(tUpHint), wa, wb, M_SET);
+    }
   }
 
-  emitStatusBar(h, false);
+  if (trans) emitStatusBar(h, tt < .25f, tt / .25f);        // version retracts first, then the layout swaps at 250 ms
+  else       emitStatusBar(h, false);
+  if (trans) otMarker(tt);
   emitFps(h, h.showFps, 140, 264, false);
   emitReveal(h.nowMs);
 }

@@ -53,6 +53,11 @@ void setSender(SendFn fn);              // ble_nav calls this once in begin()
 bool onMessage(uint8_t type, const uint8_t* payload, size_t len, bool secure);
 void onDisconnect();                    // call from the BLE disconnect callback (loop context)
 
+// While the update screen builds up, main pauses BleNav's RX queue (BleNav::resumeRx) so no chunk is flashed (blocking loop())
+// during the transition. OTA_BEGIN is still acked at once, and the phone's window (<= BLE_RXQ_DEPTH / 2) fits in the queue.
+// keepAlive() stops the idle timeout and the "re-announce" ack from firing during that pause.
+void keepAlive();
+
 void update(uint32_t nowMs);            // call every frame: timeouts, error screen timer, deferred reboot
 
 bool        active();                   // true from OTA_BEGIN until the error screen times out / reboot

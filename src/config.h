@@ -1,6 +1,6 @@
 #pragma once
 // ---- Identity / BLE ---------------------------------------------------------
-#define DEVICE_NAME          "TahVia"
+#define DEVICE_NAME          "CubiNav"
 // Custom 128-bit UUIDs. The phone app must use the same ones.
 #define BLE_SERVICE_UUID     "7a8f0001-3c5e-4b1a-9d27-5e1f4a6b7c80"
 #define BLE_RX_UUID          "7a8f0002-3c5e-4b1a-9d27-5e1f4a6b7c80"   // phone -> device (write no response)

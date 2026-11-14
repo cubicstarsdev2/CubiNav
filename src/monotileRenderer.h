@@ -25,7 +25,7 @@
 #define MTR_MAX_CMDS 96
 #endif
 #ifndef MTR_TILE
-#define MTR_TILE 8           // tile side in px: multiple of 8 that divides the screen (8, 16, 32, 40...)
+#define MTR_TILE 16           // tile side in px: multiple of 8 that divides the screen (8, 16, 32, 40...)
 #endif                        //   small = tighter changed-rectangle (fewer unchanged pixels sent), more tiles to scan
                               //   big   = less per-tile overhead (window setup), more unchanged pixels inside the rectangle
 #ifndef MTR_STATS

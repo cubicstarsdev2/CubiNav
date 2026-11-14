@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-png2frames.py - convert PNG frames into a C header of 1-bpp frames for the TahVia boot animation.
+png2frames.py - convert PNG frames into a C header of 1-bpp frames for the CubiNav boot animation.
 
   python png2frames.py frames/            ->  boot_frames.h
 

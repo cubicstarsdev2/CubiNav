@@ -7,17 +7,17 @@
 using namespace proto;
 
 // Default = NimBLE-Arduino 1.x API. 2.x is used only if the library's version header says major >= 2,
-// or if forced with -DTAHVIA_NIMBLE_V2=1 (force 1.x with -DTAHVIA_NIMBLE_V2=0).
-#ifndef TAHVIA_NIMBLE_V2
+// or if forced with -DCUBINAV_NIMBLE_V2=1 (force 1.x with -DCUBINAV_NIMBLE_V2=0).
+#ifndef CUBINAV_NIMBLE_V2
   #if defined(__has_include)
     #if __has_include(<NimBLEVersion.h>)
       #include <NimBLEVersion.h>
     #endif
   #endif
   #if defined(NIMBLE_CPP_VERSION_MAJOR) && (NIMBLE_CPP_VERSION_MAJOR >= 2)
-    #define TAHVIA_NIMBLE_V2 1
+    #define CUBINAV_NIMBLE_V2 1
   #else
-    #define TAHVIA_NIMBLE_V2 0
+    #define CUBINAV_NIMBLE_V2 0
   #endif
 #endif
 
@@ -26,7 +26,7 @@ BleNav*               g_self = nullptr;
 NimBLECharacteristic* g_tx   = nullptr;
 NimBLECharacteristic* g_batt = nullptr;
 
-#if TAHVIA_NIMBLE_V2
+#if CUBINAV_NIMBLE_V2
 class ServerCb : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* s, NimBLEConnInfo& ci) override {
     s->updateConnParams(ci.getConnHandle(), 12, 24, 0, 400);   // 15-30 ms, 4 s supervision timeout
@@ -88,7 +88,7 @@ void BleNav::begin(NavModel* m) {
 
   NimBLEServer* srv = NimBLEDevice::createServer();
   srv->setCallbacks(new ServerCb());
-#if TAHVIA_NIMBLE_V2
+#if CUBINAV_NIMBLE_V2
   srv->advertiseOnDisconnect(true);
 #endif
 
@@ -105,7 +105,7 @@ void BleNav::begin(NavModel* m) {
   g_batt = bat->createCharacteristic("2A19", NIMBLE_PROPERTY::READ | NIMBLE_PROPERTY::NOTIFY);
   uint8_t lvl = 100; g_batt->setValue(&lvl, 1);
 
-#if TAHVIA_NIMBLE_V2
+#if CUBINAV_NIMBLE_V2
   srv->start();
 #else
   svc->start();                                              // 1.x: services are started individually
@@ -114,7 +114,7 @@ void BleNav::begin(NavModel* m) {
 
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SERVICE_UUID);
-#if TAHVIA_NIMBLE_V2
+#if CUBINAV_NIMBLE_V2
   adv->setName(DEVICE_NAME);
   adv->enableScanResponse(true);
 #else
@@ -143,9 +143,9 @@ void BleNav::_onRx(const uint8_t* d, size_t n) {
 // ---- loop() side -----------------------------------------------------------------------------
 void BleNav::poll(uint32_t now) {
   if (!q_) return;
-  if (evtDisc_) { evtDisc_ = false; ota::onDisconnect(); m_->resetSession(); }
+  if (evtDisc_) { evtDisc_ = false; rxPaused_ = false; ota::onDisconnect(); m_->resetSession(); }
   RxMsg msg;
-  while (xQueueReceive(q_, &msg, 0) == pdTRUE) handle(msg.data, msg.len, now);
+  while (!rxPaused_ && xQueueReceive(q_, &msg, 0) == pdTRUE) handle(msg.data, msg.len, now);
 
   // The phone only learns about free slots from ACKs, and trimming frees them silently:
   // report when at least 64 more slots became free (checked once per second).
@@ -272,6 +272,7 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
       // With BLE_REQUIRE_PAIRING the RX characteristic only accepts writes on an encrypted link,
       // so a message that got here is already secure.
       ota::onMessage(d[0], d + 1, n - 1, true);
+      if (d[0] == OTA_BEGIN && ota::active()) rxPaused_ = true;   // chunks wait in the queue until the update screen is up (main)
       break;
 
     default: break;                                     // unknown type: ignore
