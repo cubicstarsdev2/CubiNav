@@ -34,4 +34,5 @@ struct NavModel {
   bool handleAt(const uint8_t* d, size_t n);   // AT:"msg" -> alertText/alertRev; true if it was an AT: command
  private:
   void pickNearestStart();
+  void updateRouteHeading();       // feeds pose the bearing of the route just ahead (map-matched heading)
 };

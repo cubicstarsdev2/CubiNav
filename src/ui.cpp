@@ -71,6 +71,14 @@ Renderer* R   = nullptr;
 #ifndef UI_MAP_MIN_MS
 #define UI_MAP_MIN_MS    100    // max 10 map redraws per second
 #endif
+// The map is redrawn in steps (above), but the vehicle marker is an overlay: it is moved every frame by the distance
+// travelled since the last map redraw (the map then catches up and the marker returns to the anchor, seamlessly).
+#ifndef UI_MARKER_LERP
+#define UI_MARKER_LERP   1
+#endif
+#ifndef UI_MARKER_MAX_PX
+#define UI_MARKER_MAX_PX 32.f   // never drift further than this from the anchor
+#endif
 const uint32_t REVEAL_MS  = 320;       // screen change: curtain wipe
 const uint32_t BURST_MS   = 700;       // idle: ring burst on connect
 const uint32_t POP_MS     = 260;       // idle: check badge pops in
@@ -133,7 +141,7 @@ TextSpr tBootT, tBootL, tBootV;                              // boot
 TextSpr tIdleT, tStat, tHint;                                // idle
 TextSpr tPTitle, tPTag, tPLbl, tPDig, tPH1, tPH2;            // pairing
 TextSpr tBatt, tBtLbl, tVerLbl, tFps;                        // status bar
-TextSpr tDist, tStreet, tBig, tSpeed, tUnit, tDir, tPill;    // navigation
+TextSpr tDist, tStreet, tBig, tSpeed, tUnit, tDir, tPill, tLimit;    // navigation
 TextSpr tUpLbl, tUpPct, tUpKB, tUpVer, tUpHint, tFailT, tFailE, tFailH;   // firmware update
 
 TFT_eSprite* spLogoBig = nullptr;
@@ -584,6 +592,8 @@ void dottedSeg(float x0, float y0, float x1, float y1, float& next) {
 // snaps onto it (normal case: the turn IS a waypoint); otherwise it is interpolated on the segment.
 const float    TURN_RESYNC_M = 30.f;
 const float    TURN_SNAP_M   = 12.f;
+const float    TURN_BEND_M   = 35.f;     // a maneuver is pinned to the route vertex where the road bends, if one lies this close to distToTurn
+const float    TURN_BEND_COS = 0.9f;     // ... and the bend is sharper than ~26 deg
 const uint32_t TURN_WAIT_MS  = 3000;
 uint32_t turnIdx = 0;  float turnT = 0;  uint8_t turnRoute = 255;  bool turnOk = false;
 // After the vehicle passes the pinned point the phone still reports the old (tiny) distance for a moment: hold
@@ -690,6 +700,10 @@ void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
   };
 
   // ---- next maneuver node ----
+  // distToTurn comes from the phone about once a second while the dead-reckoned marker keeps moving, so the two
+  // disagree by up to speed * ~1.5 s. Widen the tolerances with speed, or the node got re-picked (= jumped) at speed.
+  const float resyncM = TURN_RESYNC_M + m.pose.speedMs() * 2.0f;
+  const float bendM   = TURN_BEND_M + m.pose.speedMs() * 1.5f;
   int mode = 0;                                              // 0 all wide (unknown / not visible), 1 node, 2 thin (just passed)
   int na = -1; float nodeX = 0, nodeY = 0;
   if (m.distToTurn == 0xFFFF || arrived) {
@@ -715,13 +729,25 @@ void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
       if (have) {                                            // still consistent with the phone's distance?
         const int a0 = (int)(int32_t)(turnIdx - lo);
         if (a0 < sj) have = false;
-        else if (a0 <= n - 1) { if (fabsf(arcTo(a0, turnT) - d) > TURN_RESYNC_M) have = false; }
-        else if (ACC[n - 1] > d + TURN_RESYNC_M) have = false;   // should be visible by now
+        else if (a0 <= n - 1) { if (fabsf(arcTo(a0, turnT) - d) > resyncM) have = false; }
+        else if (ACC[n - 1] > d + resyncM) have = false;   // should be visible by now
       }
       if (!have) {
         turnOk = false;
-        if (d <= ACC[n - 1]) {                               // inside the visible part: find its segment
-          for (int q = sj; q < n - 1; q++) {
+        if (d <= ACC[n - 1]) {                               // inside the visible part
+          int bv = -1; float bErr = bendM;                   // 1) the bend vertex whose route distance best matches d
+          for (int v = sj + 1; v < n - 1; v++) {
+            const float err = fabsf(ACC[v] - d);
+            if (err >= bErr) continue;
+            const float ax = PX[v] - PX[v - 1], ay = PY[v] - PY[v - 1], bx = PX[v + 1] - PX[v], by = PY[v + 1] - PY[v];
+            const float la = sqrtf(ax * ax + ay * ay), lb = sqrtf(bx * bx + by * by);
+            if (la < 1e-3f || lb < 1e-3f) continue;
+            if ((ax * bx + ay * by) / (la * lb) > TURN_BEND_COS) continue;   // nearly straight: not a corner
+            bv = v; bErr = err;
+          }
+          if (bv >= 0) { turnIdx = lo + (uint32_t)bv; turnT = 0.f; turnRoute = rid; turnOk = true; have = true; }
+          // 2) otherwise find its segment
+          for (int q = sj; !have && q < n - 1; q++) {
             if (d > ACC[q + 1]) continue;
             const float L = lenM(q);
             float f = L < 1e-3f ? 0.f : (q == sj ? st + d / L : (d - ACC[q]) / L);
@@ -773,8 +799,27 @@ void drawRoute(const NavModel& m, float thetaDeg, float scale, bool arrived) {
   }
 }
 
-void emitMarker(float dx, float dy, uint32_t now, bool stale) {
-  const int cx = ANCHOR_X, cy = ANCHOR_Y;
+// Map state at the last redraw: the marker is drawn relative to it (see UI_MARKER_LERP).
+int32_t mapIx = 0, mapIy = 0;  float mapTheta = 0, mapScale = 1;  bool mapOk = false;
+
+// Offset (px) of the marker from the anchor: pose now vs pose when the map was drawn, in the map's frame.
+void markerOffset(const NavModel& m, float& ox, float& oy) {
+  ox = oy = 0.f;
+#if UI_MARKER_LERP
+  if (!mapOk) return;
+  const float th = mapTheta * 0.017453292f, c = cosf(th), s = sinf(th), k = mapScale * 0.1f;   // px per dm
+  const float e = (float)(m.pose.x() - mapIx) * k, n = (float)(m.pose.y() - mapIy) * k;
+  ox = e * c - n * s;
+  oy = -(e * s + n * c);
+  const float r2 = ox * ox + oy * oy, lim = UI_MARKER_MAX_PX;
+  if (r2 > lim * lim) { const float f = lim / sqrtf(r2); ox *= f; oy *= f; }
+#else
+  (void)m;
+#endif
+}
+
+void emitMarker(float ox, float oy, uint32_t now, bool stale) {
+  const int cx = ANCHOR_X + (int)lroundf(ox), cy = ANCHOR_Y + (int)lroundf(oy);
   if (stale) {
     R->ovBitmap(cx - 24, cy - 24, 48, 48, ptr(spDash), M_SET);          // dashed accuracy ring
     if ((now / 500) & 1) return;                                        // marker blinks
@@ -795,7 +840,6 @@ void emitMarker(float dx, float dy, uint32_t now, bool stale) {
   R->ovFillCircle(cx, cy, 19, M_CLR);                                   // halo over the route
   R->ovFillCircle(cx, cy, 14, M_SET);
   R->ovBitmap(cx - 14, cy - 14, 28, 28, ptr(spChev), M_CLR);            // white chevron
-  (void)dx; (void)dy;
 }
 
 struct ViewKey { int32_t qx, qy, qh; uint32_t rev; uint16_t zoom; uint32_t dt; uint8_t hu, fix, st; };
@@ -913,6 +957,7 @@ void initRest() {
   mk(tUnit, 0, 300, 52, 16);
   mk(tDir, 0, 293, 36, 16);
   mk(tPill, 0, 100, 160, 18);
+  mk(tLimit, 0, 0, 64, 30);                                  // speed limit sign text
   setText(tPill, "NO GPS SIGNAL", FB11, AL_L, 14, 2);
   // firmware update
   mk(tUpLbl, 0, 20, SCREEN_W, 20);
@@ -1153,6 +1198,8 @@ void navFrame(NavModel& m, const Hud& h) {
   const bool urgent  = !keyValid || k.zoom != lastKey.zoom || k.hu != lastKey.hu || k.fix != lastKey.fix;
   if (changed && (urgent || now - lastMapMs >= UI_MAP_MIN_MS)) {
     lastKey = k; keyValid = true; lastMapMs = now;
+    mapIx = (int32_t)lround(m.pose.x()); mapIy = (int32_t)lround(m.pose.y());   // same rounding as drawRoute
+    mapTheta = theta; mapScale = scale; mapOk = fix;
     clearMap();
     if (fix) drawRoute(m, theta, scale, arrived);
   }
@@ -1160,10 +1207,9 @@ void navFrame(NavModel& m, const Hud& h) {
   // ---- OVERLAY ----
   R->overlayBegin();
   if (fix) {
-    float dx = 0, dy = -1;
-    if (!cfg.headingUp) { float a = m.pose.heading() * 0.017453292f; dx = sinf(a); dy = -cosf(a); }
     updateChevron(cfg.headingUp ? 0.f : m.pose.heading());
-    emitMarker(dx, dy, now, stale || nogps);
+    float ox, oy; markerOffset(m, ox, oy);
+    emitMarker(ox, oy, now, stale || nogps);
   }
 
   // No-GPS strip (hatched, with a pill) under the banner
@@ -1233,6 +1279,24 @@ void navFrame(NavModel& m, const Hud& h) {
   const int midL = tUnit.x + wUnit;
   tDir.x = (midL + rightX) / 2 - (textW(FB11, dirTxt, 2)) / 2; tDir.y = BOT_Y + 9;
   blit(tDir, M_SET);
+
+  // Posted speed limit sign (bottom right, above the status bar). speedLimitKmh = 0 -> none known yet.
+  if (m.speedLimitKmh > 0 && !arrived) {
+    int lim = m.speedLimitKmh;                                // km/h on the wire
+    if (cfg.imperial) lim = (int)(lim / 1.609344f / 5.f + 0.5f) * 5;   // mph, nearest 5
+    char ls[8];
+    snprintf(ls, sizeof(ls), "%d", lim);
+    if (lim >= 100) setText(tLimit, ls, B17, AL_C, 21); else setText(tLimit, ls, B24, AL_C, 24);
+    const int lx = SCREEN_W - 14 - 34, ly = BOT_Y - 8 - 34;
+    // Over the limit (compared in the displayed unit, needs a live fix): the sign flashes between normal and inverted.
+    const bool over = fix && !stale && (int)(kmh + 0.5f) > lim;
+    const bool inv  = over && ((now / 400) & 1);
+    R->ovFillCircle(lx, ly, 36, M_CLR);                       // white halo: readable over the route
+    R->ovFillCircle(lx, ly, 33, M_SET);                       // thick ring
+    if (!inv) R->ovFillCircle(lx, ly, 25, M_CLR);             // inverted phase: solid black disc, white digits
+    tLimit.x = lx - tLimit.w / 2; tLimit.y = ly - tLimit.h / 2;
+    blit(tLimit, inv ? M_CLR : M_SET);
+  }
 
   emitFps(h, cfg.showFps, 8, 134, true);
   emitReveal(now);
