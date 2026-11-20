@@ -1,4 +1,4 @@
-## 1.3.5
+## 1.4.5
 # CubiNav
 
 CubiNav is ESP32 firmware for a compact, Bluetooth-connected navigation display. It receives navigation state, route geometry, positioning updates and maneuver information from a companion phone application, then renders a monochrome navigation interface on a 480 × 320 TFT.

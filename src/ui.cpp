@@ -79,7 +79,17 @@ Renderer* R   = nullptr;
 #ifndef UI_MARKER_MAX_PX
 #define UI_MARKER_MAX_PX 32.f   // never drift further than this from the anchor
 #endif
-const uint32_t REVEAL_MS  = 320;       // screen change: curtain wipe
+// Interlock reveal: the transition of every screen change (see emitReveal). UI_REVEAL_SPEED_DIV: 1.0 = designed speed (REVEAL_MS),
+// 2.0 (default) takes twice as long, 1.04 s. It does not use UI_TRANSITION_SPEED_DIV, so changing that one leaves it alone.
+#ifndef UI_REVEAL_SPEED_DIV
+#define UI_REVEAL_SPEED_DIV 2.0f
+#endif
+static_assert(UI_REVEAL_SPEED_DIV > 0, "UI_REVEAL_SPEED_DIV must be > 0");
+const uint32_t REVEAL_MS  = 520;       // screen change: interlock reveal, at designed speed
+const int      IL_COLS    = 12;        // interlock: columns (SCREEN_W / 12 = 40 px)
+const float    IL_STAGGER = .03f;      // ...each one starts this fraction of REVEAL_MS after the previous one (30 ms at designed speed)
+const float    IL_SPAN    = .62f;      // ...and takes this fraction of REVEAL_MS to cross the screen
+const int      IL_EDGE    = 3;         // ...behind a leading edge this many px thick
 const uint32_t BURST_MS   = 700;       // idle: ring burst on connect
 const uint32_t POP_MS     = 260;       // idle: check badge pops in
 const uint32_t ICON_IN_MS = 260;       // nav: icon slides in on maneuver change
@@ -87,7 +97,7 @@ const uint16_t TURN_NEAR_M = 120;      // nav: icon bobs when the turn is this c
 const uint16_t TURN_BAR_M  = 400;      // nav: proximity bar fills over the last 400 m
 // Idle <-> pairing transition (see "Idle <-> pairing transition" below). Set UI_PAIR_TRANSITION to 0 for a hard cut.
 #ifndef UI_PAIR_TRANSITION
-#define UI_PAIR_TRANSITION 1
+#define UI_PAIR_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
 const uint32_t PT_WIPE_MS       = 1000;  // curtain wipe, linear, the marker rides its edge
 const uint32_t PT_STAGE_MS      = 500;   // the pairing items run on their own clock, starting this long after the wipe began
@@ -96,15 +106,15 @@ const uint32_t PT_FLASH_MS      = 360;   // pairing accepted: digits flash inver
 const uint32_t PT_FLASH_STEP_MS = 90;
 // Idle -> firmware update transition (see "Idle -> OTA transition" below). Set UI_OTA_TRANSITION to 0 for the plain curtain wipe.
 #ifndef UI_OTA_TRANSITION
-#define UI_OTA_TRANSITION 1
+#define UI_OTA_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
 // Update -> idle transition when the update is cancelled (see "Update cancelled -> idle" below). 0 = plain curtain wipe.
 #ifndef UI_OTA_CANCEL_TRANSITION
-#define UI_OTA_CANCEL_TRANSITION 1
+#define UI_OTA_CANCEL_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
 // Update -> "Update failed" and "Update failed" -> idle (see "Update failed" below). 0 = hard cut / plain curtain wipe.
 #ifndef UI_OTA_FAIL_TRANSITION
-#define UI_OTA_FAIL_TRANSITION 1
+#define UI_OTA_FAIL_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
 // Transition Speed Dividers, one per transition, each local to its own transition: it runs that many times SLOWER.
 // 1.0 = designed speed, 2.0 = twice as long, 0.5 = twice as fast. Must be > 0.
@@ -116,7 +126,7 @@ const uint32_t PT_FLASH_STEP_MS = 90;
 // Override with e.g. -DUI_OTA_SPEED_DIV=1.5f. Any left undefined takes UI_TRANSITION_SPEED_DIV (default 2.0f), kept only as a
 // shared fallback for older build flags.
 #ifndef UI_TRANSITION_SPEED_DIV
-#define UI_TRANSITION_SPEED_DIV 2.0f
+#define UI_TRANSITION_SPEED_DIV 8.0f
 #endif
 #ifndef UI_PAIR_SPEED_DIV
 #define UI_PAIR_SPEED_DIV UI_TRANSITION_SPEED_DIV
@@ -142,7 +152,7 @@ static_assert(UI_OTA_CANCEL_SPEED_DIV > 0, "UI_OTA_CANCEL_SPEED_DIV must be > 0"
 //   UI_NAV_SPEED_DIV        idle -> nav
 //   UI_NAV_EXIT_SPEED_DIV   nav -> idle
 #ifndef UI_NAV_TRANSITION
-#define UI_NAV_TRANSITION 1
+#define UI_NAV_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
 #ifndef UI_NAV_SPEED_DIV
 #define UI_NAV_SPEED_DIV UI_TRANSITION_SPEED_DIV
@@ -156,6 +166,7 @@ static_assert(UI_NAV_EXIT_SPEED_DIV > 0, "UI_NAV_EXIT_SPEED_DIV must be > 0");
 inline uint32_t trElapsed(uint32_t now, uint32_t start, float div) { return (uint32_t)((float)(now - start) / div); }
 
 inline float easeOut(float p) { p = p < 0 ? 0 : (p > 1 ? 1 : p); return 1.f - (1.f - p) * (1.f - p); }
+inline float easeIO(float p) { p = p < 0 ? 0 : (p > 1 ? 1 : p); return p < .5f ? 2.f * p * p : 1.f - 2.f * (1.f - p) * (1.f - p); }
 inline float tri(uint32_t now, uint32_t period) {
   float p = (now % period) / (float)period;
   return p < 0.5f ? p * 2.f : (1.f - p) * 2.f;
@@ -164,15 +175,41 @@ inline float tri(uint32_t now, uint32_t period) {
 bool     revealPending = false;
 uint32_t revealStart   = 0;
 
-// Curtain: call LAST in a frame (it covers everything emitted before it).
+// Interlock reveal: call LAST in a frame (it covers everything emitted before it). Port of "Interlock" in CubiNav_Curtain_Alternatives.html.
+// The new screen is already emitted underneath. The screen is cut into IL_COLS columns that start IL_STAGGER of REVEAL_MS apart, left to
+// right. Each column slides the new screen in vertically over IL_SPAN of REVEAL_MS (ease in-out): even columns from the top, odd ones from
+// the bottom, behind a IL_EDGE px black leading edge. The part of a column the new screen has not reached yet keeps showing the OLD screen:
+// ovRestore() puts back what the panel shows (the renderer's own shadow buffer), so nothing is copied and no RAM is used.
+// That only works if nothing is drawn INTO the not-yet-reached part, so the leading edge sits on the new screen's side of the line (the
+// HTML draws it on the old side). A finished column is left alone.
+// Cost: at most one ovRestore for the columns not started, plus an ovRestore and an edge per moving column (2 * IL_COLS + 1 commands).
 void emitReveal(uint32_t now) {
 #if UI_ANIMATIONS
   if (revealPending) { revealPending = false; revealStart = now; }
-  uint32_t el = now - revealStart;
+  const uint32_t el = trElapsed(now, revealStart, (float)UI_REVEAL_SPEED_DIV);
   if (el >= REVEAL_MS) return;
-  int x = (int)(SCREEN_W * easeOut(el / (float)REVEAL_MS));
-  R->ovFillRect(x, 0, SCREEN_W - x, SCREEN_H, M_CLR);
-  R->ovFillRect(x - 3, 0, 3, SCREEN_H, M_SET);
+  const float t = (float)el / (float)REVEAL_MS;
+  const int   cw = SCREEN_W / IL_COLS;                                         // column width
+  int k = 0;                                                                   // columns [k, IL_COLS) have not started: the old screen
+  while (k < IL_COLS && t - k * IL_STAGGER > 0.f) k++;
+  if (k < IL_COLS) R->ovRestore(k * cw, 0, SCREEN_W - k * cw, SCREEN_H);
+  for (int i = 0; i < k; i++) {                                                // columns [0, k) have started
+    const float p = (t - i * IL_STAGGER) / IL_SPAN;
+    if (p >= 1.f) continue;                                                    // finished: the new screen shows as it is
+    const float q = easeIO(p);
+    const int   x = i * cw;
+    if ((i & 1) == 0) {                                                        // from the top: new screen above y, old screen below it
+      const int y = (int)lroundf(SCREEN_H * q);
+      if (y < SCREEN_H) R->ovRestore(x, y, cw, SCREEN_H - y);
+      const int ey = y < IL_EDGE ? 0 : y - IL_EDGE;
+      if (y > ey) R->ovFillRect(x, ey, cw, y - ey, M_SET);                     // leading edge, just above the old screen
+    } else {                                                                   // from the bottom: old screen above y, new screen below it
+      const int y = (int)lroundf(SCREEN_H * (1.f - q));
+      if (y > 0) R->ovRestore(x, 0, cw, y);
+      const int eh = SCREEN_H - y < IL_EDGE ? SCREEN_H - y : IL_EDGE;
+      if (eh > 0) R->ovFillRect(x, y, cw, eh, M_SET);                          // leading edge, just below the old screen
+    }
+  }
 #else
   (void)now;
 #endif
@@ -1555,7 +1592,13 @@ void pairTrUpdate(const Hud& h) {
   if (ptMode == PTR_IN && el >= PT_IN_MS) ptMode = PTR_NONE;
   else if (ptMode == PTR_OUT && el >= (ptOk ? PT_FLASH_MS : 0) + PT_WIPE_MS) ptMode = PTR_NONE;
 #else
+#if UI_ANIMATIONS
+  // Bespoke transition off: a change of Hud::pairing is a screen change, so it gets the interlock reveal like every other one.
+  if (ptFresh) { ptFresh = false; ptPrev = h.pairing; return; }       // screen just entered: enter() already started the reveal
+  if (h.pairing != ptPrev) { ptPrev = h.pairing; revealPending = true; }
+#else
   (void)h;
+#endif
 #endif
 }
 
@@ -1579,8 +1622,6 @@ uint32_t otStart = 0;
 float    otS0 = 0.f, otV0 = 0.f, otXm = 0.f;                 // marker start (px along the road), start speed, wave origin x
 int      otN = 0;
 int16_t  otDX[TR_MAX_DOTS], otDY[TR_MAX_DOTS], otDT[TR_MAX_DOTS];   // dots: start x, y, and target x on the ruler
-
-inline float easeIO(float p) { p = p < 0 ? 0 : (p > 1 ? 1 : p); return p < .5f ? 2.f * p * p : 1.f - 2.f * (1.f - p) * (1.f - p); }
 
 // Window [a, b) of an element that squeezes shut toward its centre (p 0..1). False once closed.
 inline bool shutWin(int x0, int x1, float p, int& a, int& b) {
@@ -1613,7 +1654,7 @@ void updateRuler() {
 }
 
 // Called from enter(): snapshot the idle state the transition starts from.
-void otBegin() {
+__attribute__((unused)) void otBegin() {
   const float v = trL / IP_LAP_S;
   const bool still = ipPh == IP_PARK || ipPh == IP_READY || ipPh == IP_LOST;
   otConn = ipConn;
@@ -1933,7 +1974,7 @@ void nvBuildDots() {
   nvLead = (s0 - trParkS) * NV_KEND;
 }
 
-void nvBegin(bool entering) {
+__attribute__((unused)) void nvBegin(bool entering) {
   nvActive = nvPending = true;
   nvIn = entering;
   nvMkKey = -1;
@@ -2039,7 +2080,7 @@ void emitMorphMarker(float fx, float fy, float deg, float s) {
   R->ovBitmap(cx - 14, cy - 14, 28, 28, ptr(spMorph), M_CLR);
 }
 
-void nvLimitText(int lim) {                                  // same sprite navFrame() uses in steady state
+__attribute__((unused)) void nvLimitText(int lim) {                                  // same sprite navFrame() uses in steady state
   char ls[8];
   snprintf(ls, sizeof(ls), "%d", lim);
   if (lim >= 100) setText(tLimit, ls, B17, AL_C, 21); else setText(tLimit, ls, B24, AL_C, 24);
@@ -2408,12 +2449,12 @@ void enter(Screen s) {
   upLive = upShown = upSteady = upFailed = false;
   ipFresh = true;                                           // idle: no transition replay when the screen is (re)entered
   ptFresh = true; ptMode = PTR_NONE;                         // same for the idle <-> pairing transition
-  revealPending = !otActive && !cxActive && !nvActive;       // the OTA, cancel and nav transitions replace the curtain wipe
+  revealPending = !otActive && !cxActive && !nvActive;       // the OTA, cancel and nav transitions replace the interlock reveal
   if (s == SCR_UPDATE && !otActive) updateRuler();           // static ruler under the progress bar
 }
 
 bool transitionBusy(uint32_t nowMs) {
-  return otActive || cxActive || nvActive || revealPending || (uint32_t)(nowMs - revealStart) < REVEAL_MS;
+  return otActive || cxActive || nvActive || revealPending || trElapsed(nowMs, revealStart, (float)UI_REVEAL_SPEED_DIV) < REVEAL_MS;
 }
 
 // ---- Idle / pairing -------------------------------------------------------------------
@@ -2712,7 +2753,12 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     if (ft >= FT_END) { erActive = false; ft = 99.f; }
   }
 #else
+#if UI_ANIMATIONS
+  // Bespoke transition off: update -> failed is a screen change, so it gets the interlock reveal.
+  if (err && prevShown) revealPending = true;
+#else
   (void)prevShown;
+#endif
 #endif
 
   R->overlayBegin();

@@ -318,6 +318,7 @@ bool Renderer::ovFillRect(int x, int y, int w, int h, Mode m) { Cmd c; return mk
 bool Renderer::ovRect(int x, int y, int w, int h, Mode m)     { Cmd c; return mkRect(c, OP_RECT, x, y, w, h, m) && addCmd(c); }
 bool Renderer::ovCircle(int cx, int cy, int r, Mode m)        { return addCmd(mkCircle(OP_CIRCLE, cx, cy, r, m)); }
 bool Renderer::ovFillCircle(int cx, int cy, int r, Mode m)    { return addCmd(mkCircle(OP_FILL_CIRCLE, cx, cy, r, m)); }
+bool Renderer::ovRestore(int x, int y, int w, int h) { Cmd c; return mkRect(c, OP_RESTORE, x, y, w, h, SET) && addCmd(c); }
 bool Renderer::ovBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m) {
   Cmd c;
   if (!mkRect(c, OP_BITMAP, x, y, w, h, m)) return false;
@@ -341,6 +342,23 @@ void Renderer::closeOverlay() {
 }
 
 // ---- Render ----
+// OP_RESTORE: el area del comando dentro del tile se reemplaza por lo que la pantalla muestra (shown_ del mismo tile).
+void Renderer::restoreRect(int tx, int ty, const Cmd& c) {
+  const int px = tx * TILE, py = ty * TILE, t = ty * TILES_X + tx;
+  const int xa = (c.x0 > px ? c.x0 : px) - px, xb = (c.x1 < px + TILE - 1 ? c.x1 : px + TILE - 1) - px;
+  const int ya = (c.y0 > py ? c.y0 : py) - py, yb = (c.y1 < py + TILE - 1 ? c.y1 : py + TILE - 1) - py;
+  const uint8_t* sh = shown_ + py * STRIDE + (px >> 3);
+  for (int r = ya; r <= yb; r++)
+    for (int k = xa >> 3; k <= xb >> 3; k++) {
+      uint8_t mask = 0xFF;
+      if (k == (xa >> 3)) mask &= (uint8_t)(0xFF >> (xa & 7));
+      if (k == (xb >> 3)) mask &= (uint8_t)(0xFF << (7 - (xb & 7)));
+      const uint8_t old = shownOk_[t] ? sh[r * STRIDE + k] : 0;
+      uint8_t& d = tile_[r * TB + k];
+      d = (uint8_t)((d & ~mask) | (old & mask));
+    }
+}
+
 void Renderer::composeTile(int tx, int ty) {
   const int px = tx * TILE, py = ty * TILE;
   for (int r = 0; r < TILE; r++)
@@ -350,6 +368,7 @@ void Renderer::composeTile(int tx, int ty) {
   for (int i = 0; i < nCur_; i++) {
     const Cmd& c = cur_[i];
     if (c.x1 < px || c.x0 >= px + TILE || c.y1 < py || c.y0 >= py + TILE) continue;
+    if (c.op == OP_RESTORE) { restoreRect(tx, ty, c); continue; }
     execCmd(s, c);
   }
 }

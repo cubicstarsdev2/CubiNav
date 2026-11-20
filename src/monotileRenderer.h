@@ -22,10 +22,10 @@
 #define MTR_HEIGHT 320
 #endif
 #ifndef MTR_MAX_CMDS
-#define MTR_MAX_CMDS 96
+#define MTR_MAX_CMDS 180
 #endif
 #ifndef MTR_TILE
-#define MTR_TILE 16           // tile side in px: multiple of 8 that divides the screen (8, 16, 32, 40...)
+#define MTR_TILE 32           // tile side in px: multiple of 8 that divides the screen (8, 16, 32, 40...)
 #endif                        //   small = tighter changed-rectangle (fewer unchanged pixels sent), more tiles to scan
                               //   big   = less per-tile overhead (window setup), more unchanged pixels inside the rectangle
 #ifndef MTR_STATS
@@ -55,7 +55,7 @@ static_assert(MTR_WIDTH % TILE == 0 && MTR_HEIGHT % TILE == 0,
               "El tamano de pantalla debe ser multiplo de TILE");
 
 enum Mode : uint8_t { CLEAR = 0, SET = 1, XOR = 2 };
-enum Op : uint8_t { OP_LINE, OP_FILL_RECT, OP_RECT, OP_CIRCLE, OP_FILL_CIRCLE, OP_BITMAP };
+enum Op : uint8_t { OP_LINE, OP_FILL_RECT, OP_RECT, OP_CIRCLE, OP_FILL_CIRCLE, OP_BITMAP, OP_RESTORE };
 
 struct Cmd {
   uint8_t  op, mode, width, _pad;
@@ -104,6 +104,10 @@ class Renderer {
   bool ovCircle(int cx, int cy, int r, Mode m = SET);
   bool ovFillCircle(int cx, int cy, int r, Mode m = SET);
   bool ovBitmap(int x, int y, int w, int h, const uint8_t* bits, Mode m = SET);
+  // Vuelve a poner en el rectangulo lo que la pantalla muestra ahora (shown_): sirve para conservar la pantalla anterior durante una
+  // transicion, sin copiarla (0 bytes extra). Se evalua al componer cada tile, antes de actualizar su shown_. Tiles con shownOk_ = 0 -> fondo.
+  // Solo es fiel mientras lo que se dibuje encima NO toque esos pixeles: lo que cae dentro del rectangulo se pierde en shown_.
+  bool ovRestore(int x, int y, int w, int h);
 
   // ---- Salida ----
   // maxPixels = 0 -> sin limite. Si no, deja de empezar tiles nuevos al superar el presupuesto
@@ -130,6 +134,7 @@ class Renderer {
   bool addCmd(const Cmd& c);
   void closeOverlay();
   void composeTile(int tx, int ty);
+  void restoreRect(int tx, int ty, const Cmd& c);
   int  sendTile(int t, bool& open);            // devuelve pixeles enviados (0 = nada cambio)
   void buildLut();
   bool isDirty(int t) const { return dirty_[t >> 5] & (1u << (t & 31)); }
