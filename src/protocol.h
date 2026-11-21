@@ -14,7 +14,7 @@
 // then at most ONE letter (e.g. "1.0.0R"; case-insensitive, shown upper-case).
 // Can still be overridden from the build flags:  -DFW_VERSION_STRING=\"1.2.3\"
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "1.0.1R"
+#define FW_VERSION_STRING "1.0.2R"
 #endif
 
 // Wire format (HELLO_ACK / OTA_BEGIN, u32): (letter << 16) | (major << 8) | (minor << 4) | patch.
