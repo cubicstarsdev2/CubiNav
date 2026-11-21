@@ -1,6 +1,6 @@
 #pragma once
 // ---- Identity / BLE ---------------------------------------------------------
-#define DEVICE_NAME          "CubiNav"
+#define DEVICE_NAME          "CubiNav"   // prefix: advertised name is "CubiNav-XXXX" (device_name.h)
 // Custom 128-bit UUIDs. The phone app must use the same ones.
 #define BLE_SERVICE_UUID     "7a8f0001-3c5e-4b1a-9d27-5e1f4a6b7c80"
 #define BLE_RX_UUID          "7a8f0002-3c5e-4b1a-9d27-5e1f4a6b7c80"   // phone -> device (write no response)
@@ -11,6 +11,11 @@
 // 1 = LE Secure Connections + bonding, passkey shown on the TFT. 0 = open link (bench testing).
 #ifndef BLE_REQUIRE_PAIRING
 #define BLE_REQUIRE_PAIRING  1
+#endif
+// Bench only: 1 = forget the saved "setup done" key at every boot, so every boot is a first boot and shows the SETUP screen
+// (-DCUBINAV_FORCE_SETUP=1 in build_flags). Leave it 0 for a real build: with 0 the setup screen shows once, until setup completes.
+#ifndef CUBINAV_FORCE_SETUP
+#define CUBINAV_FORCE_SETUP  0
 #endif
 
 // ---- Screen -----------------------------------------------------------------

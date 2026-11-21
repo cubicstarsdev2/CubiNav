@@ -13,7 +13,7 @@
 // No build script needed: the string is parsed at compile time. Limits: major 0-255, minor 0-15, patch 0-15.
 // Can still be overridden from the build flags:  -DFW_VERSION_STRING=\"1.2.3\"
 #ifndef FW_VERSION_STRING
-#define FW_VERSION_STRING "1.4.5"
+#define FW_VERSION_STRING "1.0.0R"
 #endif
 
 // Wire format (HELLO_ACK / OTA_BEGIN, u16): (major << 8) | (minor << 4) | patch.  1.0.0 == 0x0100.
@@ -52,8 +52,8 @@ namespace proto {
 enum Msg : uint8_t {
   HELLO = 0x01, REBASE = 0x03, POSE = 0x10,
   ROUTE_BEGIN = 0x20, ROUTE_CHUNK = 0x21, ROUTE_COMMIT = 0x22, ROUTE_CLEAR = 0x23,
-  MANEUVER = 0x30, CONFIG = 0x40, NAV_STATE = 0x50,
-  HELLO_ACK = 0x81, ROUTE_ACK = 0x82,
+  MANEUVER = 0x30, CONFIG = 0x40, SETUP_CONFIG = 0x41, NAV_STATE = 0x50,
+  HELLO_ACK = 0x81, ROUTE_ACK = 0x82, SETUP_ACK = 0x84,
   // ---- OTA firmware update (see OTA_PROTOCOL.md) ----
   OTA_BEGIN = 0x60, OTA_CHUNK = 0x61, OTA_END = 0x62, OTA_ABORT = 0x63,   // phone -> device
   OTA_ACK = 0x83                                                           // device -> phone
@@ -63,6 +63,8 @@ enum OtaStatus : uint8_t {
   OTA_OK = 0, OTA_E_STATE = 1, OTA_E_SIZE = 2, OTA_E_GAP = 3, OTA_E_FLASH = 4, OTA_E_MD5 = 5,
   OTA_E_BATTERY = 6, OTA_E_TIMEOUT = 7, OTA_E_ARGS = 8, OTA_E_ABORTED = 9, OTA_E_NOT_SECURE = 10, OTA_E_IMAGE = 11
 };
+// SETUP_ACK status (see PROTOCOL_SETUP.md)
+enum SetupStatus : uint8_t { SETUP_OK = 0, SETUP_E_SCHEMA = 1, SETUP_E_LANG = 2, SETUP_E_ARGS = 3, SETUP_E_NVS = 4 };
 enum Ack : uint8_t { ACK_OK = 0, ACK_GAP = 1, ACK_FULL = 2, ACK_UNKNOWN = 3 };
 enum NavStateId : uint8_t { NAV_IDLE = 0, NAV_NAVIGATING = 1, NAV_REROUTING = 2, NAV_ARRIVED = 3, NAV_NO_GPS = 4 };
 enum CfgFlag : uint8_t { CFG_HEADING_UP = 1, CFG_INVERT = 2, CFG_SHOW_FPS = 4, CFG_IMPERIAL = 8 };

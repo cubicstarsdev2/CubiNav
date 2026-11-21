@@ -3,8 +3,21 @@
 #include <esp_random.h>
 #include "config.h"
 #include "ota.h"
+#include "device_name.h"
+#include "startup.h"
+#include "device_config.h"
 
 using namespace proto;
+
+// Serial log of the BLE link (connect, pairing, every message in/out except the high-rate POSE / chunk traffic). -DCUBINAV_BLE_LOG=0 to silence.
+#ifndef CUBINAV_BLE_LOG
+#define CUBINAV_BLE_LOG 1
+#endif
+#if CUBINAV_BLE_LOG
+  #define BLOG(...) do { Serial.printf(__VA_ARGS__); Serial.print("\r\n"); } while (0)
+#else
+  #define BLOG(...) do {} while (0)
+#endif
 
 // Default = NimBLE-Arduino 1.x API. 2.x is used only if the library's version header says major >= 2,
 // or if forced with -DCUBINAV_NIMBLE_V2=1 (force 1.x with -DCUBINAV_NIMBLE_V2=0).
@@ -79,8 +92,15 @@ void BleNav::begin(NavModel* m) {
   q_ = xQueueCreate(BLE_RXQ_DEPTH, sizeof(RxMsg));
   ota::setSender([](const uint8_t* m, size_t n) { g_self->send(m, n); });   // OTA_ACK goes out on the TX characteristic
 
-  NimBLEDevice::init(DEVICE_NAME);
+  NimBLEDevice::init(devname::get());
   NimBLEDevice::setMTU(BLE_MTU);
+  // First boot = no "setup done" key in NVS yet -> the SETUP screen shows. Once setup completes (first pairing, or first
+  // connection on an open link) the key is saved and every later boot skips the screen. The key alone decides: old BLE bonds
+  // left in flash do not count (startup.h).
+#if CUBINAV_FORCE_SETUP
+  startup::clearSetup();                                       // bench: every boot is a first boot (see config.h)
+#endif
+  configured_ = startup::setupDone();
 #if BLE_REQUIRE_PAIRING
   NimBLEDevice::setSecurityAuth(true, true, true);             // bonding, MITM, LE Secure Connections
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);      // we show the passkey on the TFT
@@ -115,12 +135,18 @@ void BleNav::begin(NavModel* m) {
   NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
   adv->addServiceUUID(BLE_SERVICE_UUID);
 #if CUBINAV_NIMBLE_V2
-  adv->setName(DEVICE_NAME);
+  adv->setName(devname::get());
   adv->enableScanResponse(true);
 #else
   adv->setScanResponse(true);                                // name comes from NimBLEDevice::init()
 #endif
-  adv->start();
+  // Advertising does NOT start here: main calls startAdvertising() once the boot sequence is over and the first screen has been
+  // chosen. A phone with an old bond reconnects within a second or two; if it could do that during the boot animation, setup would
+  // be marked done before the SETUP screen was ever picked and the unit would boot straight to IDLE.
+}
+
+void BleNav::startAdvertising() {
+  NimBLEDevice::getAdvertising()->start();
 }
 
 void BleNav::setBatteryLevel(uint8_t pct) {
@@ -130,19 +156,26 @@ void BleNav::setBatteryLevel(uint8_t pct) {
 }
 
 // ---- callbacks (NimBLE task) -----------------------------------------------------------------
-void BleNav::_onConnect()    { connected_ = true; if (q_) xQueueReset(q_); }
-void BleNav::_onDisconnect() { connected_ = false; pairing_ = false; evtDisc_ = true; if (q_) xQueueReset(q_); }
-uint32_t BleNav::_onPasskey() { passkey_ = esp_random() % 1000000UL; pairing_ = true; return passkey_; }
-void BleNav::_onAuthDone()   { pairing_ = false; }
+void BleNav::_onConnect() {
+  connected_ = true; if (q_) xQueueReset(q_);
+  BLOG("[ble] connected (configured=%d)", (int)configured_);
+#if !BLE_REQUIRE_PAIRING
+  authed_ = true;                          // open link (bench): there is no pairing
+#endif
+}
+void BleNav::_onDisconnect() { BLOG("[ble] disconnected (authed=%d)", (int)authed_); connected_ = false; pairing_ = false; authed_ = false; evtDisc_ = true; if (q_) xQueueReset(q_); }
+uint32_t BleNav::_onPasskey() { BLOG("[ble] passkey requested"); passkey_ = esp_random() % 1000000UL; pairing_ = true; return passkey_; }
+void BleNav::_onAuthDone()   { BLOG("[ble] authenticated + encrypted"); pairing_ = false; authed_ = true; }   // pairing is only authentication; setup completes with SETUP_CONFIG   // only called on an encrypted link (see ServerCb)
 void BleNav::_onRx(const uint8_t* d, size_t n) {
-  if (!q_ || n == 0 || n > BLE_MAX_MSG) { if (m_) m_->badMsgs++; return; }
+  if (!q_ || n == 0 || n > BLE_MAX_MSG) { BLOG("[ble] RX rejected len=%u", (unsigned)n); if (m_) m_->badMsgs++; return; }
   RxMsg msg; msg.len = (uint8_t)n; memcpy(msg.data, d, n);
-  if (xQueueSend(q_, &msg, 0) != pdTRUE && m_) m_->droppedMsgs++;   // route gaps recover via ACK
+  if (xQueueSend(q_, &msg, 0) != pdTRUE && m_) { m_->droppedMsgs++; BLOG("[ble] RX queue full, 0x%02X dropped", d[0]); }   // route gaps recover via ACK
 }
 
 // ---- loop() side -----------------------------------------------------------------------------
 void BleNav::poll(uint32_t now) {
   if (!q_) return;
+  if (restartAtMs_ && (int32_t)(now - restartAtMs_) >= 0) { Serial.println("[setup] restarting"); Serial.flush(); ESP.restart(); }
   if (evtDisc_) { evtDisc_ = false; rxPaused_ = false; ota::onDisconnect(); m_->resetSession(); }
   RxMsg msg;
   while (!rxPaused_ && xQueueReceive(q_, &msg, 0) == pdTRUE) handle(msg.data, msg.len, now);
@@ -157,13 +190,17 @@ void BleNav::poll(uint32_t now) {
 }
 
 void BleNav::send(const uint8_t* d, size_t n) {
-  if (connected_ && g_tx) g_tx->notify(d, n);
+  if (!(connected_ && g_tx)) { BLOG("[ble] TX 0x%02X dropped: not connected", d[0]); return; }
+  g_tx->notify(d, n);                                                  // returns void in this NimBLE version: no delivery result
+  if (d[0] != ROUTE_ACK) BLOG("[ble] TX 0x%02X %uB sent", d[0], (unsigned)n);
 }
 
 void BleNav::sendHelloAck() {
-  uint8_t b[10];
+  uint8_t b[11];
   b[0] = HELLO_ACK; b[1] = PROTO_VERSION;
   wrU16(b + 2, FW_VERSION); wrU16(b + 4, SCREEN_W); wrU16(b + 6, SCREEN_H); wrU16(b + 8, RouteRing::CAP);
+  BLOG("[ble] HELLO -> HELLO_ACK fw=0x%04X configured=%d", (unsigned)FW_VERSION, (int)configured_);
+  b[10] = configured_ ? 1 : 0;                          // optional byte 10 (FW 1.5.0+): 0 = first-time setup pending
   send(b, sizeof(b));
 }
 
@@ -180,6 +217,7 @@ void BleNav::sendAck(uint8_t id, uint8_t status, uint32_t expected, uint16_t fre
 void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
   NavModel& m = *m_;
   if (n < 1) return;
+  if (d[0] != POSE && d[0] != ROUTE_CHUNK && d[0] != OTA_CHUNK) BLOG("[ble] RX 0x%02X %uB", d[0], (unsigned)n);
   if (d[0] == 'A' && m.handleAt(d, n)) return;          // AT:"message" -> flashing panel ('A' is not a protocol id)
   switch (d[0]) {
     case HELLO:
@@ -261,6 +299,20 @@ void BleNav::handle(const uint8_t* d, size_t n, uint32_t now) {
         m.cfg.imperial  = f & CFG_IMPERIAL;
       }
       break;
+
+    case SETUP_CONFIG: {                                // persistent first-time setup (PROTOCOL_SETUP.md); NVS is written here, never in a NimBLE callback
+      if (restartAtMs_) break;                          // already applied, restarting
+      uint8_t st = (n == 6) ? devcfg::validate(d[1], d[2], d[3], rdU16(d + 4)) : (uint8_t)SETUP_E_ARGS;
+      if (st == SETUP_OK) {
+        devcfg::Config c; c.language = d[2]; c.flags = d[3]; c.zoom = rdU16(d + 4);
+        if (!devcfg::save(c)) st = SETUP_E_NVS;
+      }
+      BLOG("[setup] lang=%u flags=0x%02X zoom=%u len=%u -> status %u", n > 2 ? d[2] : 0, n > 3 ? d[3] : 0, n >= 6 ? rdU16(d + 4) : 0, (unsigned)n, (unsigned)st);
+      const uint8_t a[2] = { SETUP_ACK, st };
+      send(a, sizeof(a));
+      if (st == SETUP_OK) restartAtMs_ = (now + 600) | 1;   // ACK is sent only after the verified save; give it time to leave, then restart
+      break;
+    }
 
     case NAV_STATE:
       if (n < 2) { m.badMsgs++; break; }

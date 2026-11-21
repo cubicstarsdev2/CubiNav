@@ -47,6 +47,7 @@ struct Info {
 };
 
 void setSender(SendFn fn);              // ble_nav calls this once in begin()
+void reserveHeap();                     // main calls this once after ui::bootEnd(): parks the 4 KB block Update.begin() needs (see ota.cpp)
 
 // `payload` = bytes after the message-type byte. `secure` = link is encrypted/bonded.
 // Returns true if `type` is an OTA message (handled here).

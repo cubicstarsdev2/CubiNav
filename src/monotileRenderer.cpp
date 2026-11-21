@@ -224,9 +224,10 @@ void Renderer::buildLut() {
 #endif
   };
   uint16_t f = sw(fg_), b = sw(bg_);
-  for (int v = 0; v < 256; v++)
-    for (int i = 0; i < 8; i++)
-      lut_[v][i] = ((v >> (7 - i)) & 1) ? f : b;
+  // One entry per 4-bit nibble (MSB first). A source byte is expanded with two lookups: high nibble, then low nibble.
+  for (int v = 0; v < 16; v++)
+    for (int i = 0; i < 4; i++)
+      lut_[v][i] = ((v >> (3 - i)) & 1) ? f : b;
 }
 
 void Renderer::invalidateAll() {
@@ -422,8 +423,12 @@ int Renderer::sendTile(int t, bool& open) {
     disp_.pushMono(disp_.ctx, x, y, w, h, tile_ + r0 * TB + c0, TB);
   } else {
     for (int r = 0; r < h; r++)
-      for (int k = c0; k <= c1; k++)
-        memcpy(out_ + r * w + (k - c0) * 8, lut_[tile_[(r0 + r) * TB + k]], 8 * sizeof(uint16_t));
+      for (int k = c0; k <= c1; k++) {
+        const uint8_t v = tile_[(r0 + r) * TB + k];
+        uint16_t* o = out_ + r * w + (k - c0) * 8;
+        memcpy(o,     lut_[v >> 4], 4 * sizeof(uint16_t));
+        memcpy(o + 4, lut_[v & 15], 4 * sizeof(uint16_t));
+      }
     disp_.push(disp_.ctx, x, y, w, h, out_);
   }
   st_.pushUs += MTR_NOW_US() - t1;

@@ -210,4 +210,6 @@
  C:/Users/Tahiel/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/bt/include/esp32/include/esp_bt.h \
  C:/Users/Tahiel/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/esp_system/include/esp_task.h \
  C:/Users/Tahiel/.platformio/packages/framework-arduinoespressif32/tools/sdk/esp32/include/freertos/include/esp_additions/freertos/FreeRTOSConfig.h \
- src/ota.h
+ src/ota.h src/device_name.h src/startup.h \
+ C:/Users/Tahiel/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
+ src/device_config.h src/language.h

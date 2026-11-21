@@ -152,7 +152,7 @@ class Renderer {
   bool     overlayOpen_ = false;
   alignas(4) uint8_t tile_[TILE * TB];
   uint16_t out_[TILE * TILE];                  // solo camino push
-  uint16_t lut_[256][8];
+  uint16_t lut_[16][4];                        // nibble -> 4 RGB565 pixels (was a 256x8 byte table = 4 KB; this is 128 B)
   uint16_t scan_ = 0;
   Stats    st_{};
 };

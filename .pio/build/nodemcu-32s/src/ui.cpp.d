@@ -232,5 +232,6 @@
  .pio/libdeps/nodemcu-32s/TFT_eSPI/Extensions/Button.h \
  .pio/libdeps/nodemcu-32s/TFT_eSPI/Extensions/Sprite.h \
  src/MonoTileRenderer.h src/nav_model.h src/route_ring.h src/protocol.h \
- src/pose_filter.h src/config.h src/ota.h src/tv_fonts.h \
- src/boot_frames.h src/boot_alpha.h
+ src/pose_filter.h src/config.h src/ota.h src/language.h src/tv_fonts.h \
+ src/tv_fonts_setup.h src/device_name.h src/qr_app.h src/boot_frames.h \
+ src/boot_alpha.h src/setup_mascot_start.h src/setup_mascot_loop.h

@@ -8,7 +8,7 @@
 
 namespace ui {
 
-enum Screen : uint8_t { SCR_IDLE = 0, SCR_NAV = 1, SCR_UPDATE = 2 };
+enum Screen : uint8_t { SCR_IDLE = 0, SCR_NAV = 1, SCR_UPDATE = 2, SCR_SETUP = 3, SCR_WAITSETUP = 4 };
 
 struct Hud {                 // per-frame data owned by main
   int      battPct;          // -1 = unknown
@@ -26,6 +26,7 @@ void initBoot(TFT_eSPI* tft, mtr::Renderer* r);   // logo + title sprites only (
 void initRest();                                  // all other sprites and icons
 void bootDraw();                                  // logo, title, empty bar
 void bootLabel(const char* s);
+void bootEnd();                                   // boot finished: frees the animation buffer
 void bootBar(int pct);                            // 0..100
 void bootAnimTick(uint32_t nowMs);                // advance the boot animation (needs boot_frames.h)
 bool bootAnimDone();                              // last frame shown (true when there is no animation)
@@ -41,6 +42,8 @@ bool transitionBusy(uint32_t nowMs);              // a transition into the curre
                                                   // cancel -> idle sweep, idle <-> nav, or the interlock reveal). main keeps the RX queue held
                                                   // (no "go ahead" ack to the phone, nothing parsed) until it is false, so no traffic competes
                                                   // with the animation.
+void shutdownTransition();                        // current screen -> blank (interlock), blocking, ~0.5 s (-DUI_SHUTDOWN_SPEED_DIV=<float>). Call right
+                                                  // before a restart, from loop()'s task. Runs once. main.cpp hooks it to every esp_restart().
 void idleFrame(const Hud& h);                     // phone not connected / no route / pairing
                                                   // Also plays the idle <-> pairing transition, driven by Hud edges:
                                                   //   pairing rises  -> marker pulls the wipe, pairing screen builds up (~2 s)
@@ -56,6 +59,12 @@ void navFrame(NavModel& m, const Hud& h);         // route + marker + HUD
                                                   // screen): the same, backwards. It ends on the parked marker with the START ring grown, or,
                                                   // when Hud::connected is false, with the damaged marker and idle resuming in SEARCHING.
                                                   // No protocol change. Disable both with -DUI_NAV_TRANSITION=0.
+void waitSetupFrame(const Hud& h);                // paired but not configured: app icon + "Continue your setup on the CubiNav Connect app" (language.cpp)
+void setupFrame(const Hud& h);                    // first-boot setup: QR code to get the app + the device name to pick in it
+                                                  // Shown by main while no phone is bonded (and no pairing is running). Pairing rising switches to
+                                                  // the idle screen, which draws the pairing code; once bonded the device never comes back here.
+                                                  // Static content goes to BASE once per enter(); only the pulse ring and the status bar are overlay.
+                                                  // The change into / out of it is the interlock reveal like every other screen.
 void updateFrame(const ota::Info& o, const Hud& h);   // firmware update: progress / done / failed
                                                   // Also plays the idle -> update transition (~1.85 s: scenery closes, the road
                                                   // flattens into the progress ruler, the update screen builds on it). It starts

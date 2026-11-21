@@ -19,6 +19,7 @@
 */
 #include <Arduino.h>
 #include <SPI.h>
+#include <esp_system.h>
 #include <TFT_eSPI.h>
 #include "MonoTileRenderer.h"
 #include "config.h"
@@ -27,6 +28,8 @@
 #include "ble_nav.h"
 #include "ota.h"
 #include "ui.h"
+#include "device_config.h"
+#include "language.h"
 
 // ---- Tile budget (NAV screen only) ---------------------------------------------------------------
 // NOTE: rend.flush() budgets are in PIXELS (renderer v2), so the tile counts below are converted with
@@ -81,6 +84,16 @@ static void applyColors(bool invert) {
   appliedInvert = invert;
 }
 
+// ---- Restart: screen -> blank first ------------------------------------------------------------
+// esp_restart() (so ESP.restart(), the OTA reboot, a reset command...) runs the registered shutdown handlers just before it resets,
+// so this one catches every restart without touching the callers. The renderer belongs to loop(): a restart requested from another
+// task (e.g. the BLE host task) skips the animation instead of drawing from there. Watchdog / panic / brownout resets cannot be caught.
+static TaskHandle_t uiTask = nullptr;
+static void onShutdown() {
+  if (xTaskGetCurrentTaskHandle() != uiTask) return;
+  ui::shutdownTransition();
+}
+
 // ---- Boot ------------------------------------------------------------------------------------
 static float bootShown = 0;
 
@@ -108,6 +121,8 @@ static void bootAnimWait() {
 void setup() {
   Serial.begin(9600);                  // 9600 baud made the once-per-second stats line block loop()
 
+  { devcfg::Config dc; devcfg::load(dc); devcfg::apply(dc, model.cfg); lang::set(dc.language); }   // saved settings (defaults + English if none)
+
   tft.init();
   tft.setRotation(1);                    // 480x320 landscape
   tft.fillScreen(TFT_WHITE);
@@ -122,21 +137,27 @@ void setup() {
   ui::bootDraw();
   rend.flush();
 
-  ui::bootLabel("Loading interface...");   rend.flush();
+  ui::bootLabel(lang::tr(lang::S_BOOT_LOADING));   rend.flush();
   ui::initRest();                          bootTo(40);
 
-  ui::bootLabel("Checking battery...");    rend.flush();
+  ui::bootLabel(lang::tr(lang::S_BOOT_BATTERY));    rend.flush();
   battery::begin();                        bootTo(55);
 
-  ui::bootLabel("Starting Bluetooth...");  rend.flush();
+  ui::bootLabel(lang::tr(lang::S_BOOT_BT));  rend.flush();
   ble.begin(&model);                       bootTo(90);
 
-  ui::bootLabel("Ready");                  bootTo(100);
+  ui::bootLabel(lang::tr(lang::S_BOOT_READY));                  bootTo(100);
   bootAnimWait();
   delay(300);
+  ui::bootEnd();                         // free the boot animation buffer (heap for OTA)
+  ota::reserveHeap();                    // park a 4 KB block for Update.begin() so cancel + restart cannot fragment it away
 
-  screen = ui::SCR_IDLE;                   // boot screen -> idle screen
+  screen = ble.configured() ? ui::SCR_IDLE : ui::SCR_SETUP;   // boot screen -> setup (first-time setup never completed, flag in NVS) or idle
   ui::enter(screen);
+  uiTask = xTaskGetCurrentTaskHandle();  // setup() and loop() run in the same Arduino task
+  esp_register_shutdown_handler(onShutdown);
+  Serial.printf("[start-up] setup key %s -> %s screen\n", ble.configured() ? "set" : "absent", screen == ui::SCR_SETUP ? "SETUP" : "IDLE");
+  ble.startAdvertising();                // only now can a phone connect, so nothing can flip the decision above
   Serial.println("CubiNav ready");
 }
 
@@ -180,9 +201,15 @@ void loop() {
 
   // ---- which screen? ----
   // The update screen wins over everything: from OTA_BEGIN until the error screen times out / reboot.
+  // SETUP while no phone has ever been bonded. Pairing rising hands over to the idle screen (it draws the code); a failed pairing
+  // falls back here, a successful one shows the "continue in the app" screen until SETUP_CONFIG is saved.
   ui::Screen want = ota::active() ? ui::SCR_UPDATE
                   : (ble.connected() && model.hasRoute() && model.navState != proto::NAV_IDLE)
-                      ? ui::SCR_NAV : ui::SCR_IDLE;
+                      ? ui::SCR_NAV
+                  : ble.configured() ? ui::SCR_IDLE
+                  // not configured: QR screen -> (pairing code on the idle screen) -> "continue in the app" once authenticated
+                  : (ble.authed() && (screen == ui::SCR_WAITSETUP || !ui::transitionBusy(nowMs))) ? ui::SCR_WAITSETUP
+                  : (!ble.authed() && !ble.pairing()) ? ui::SCR_SETUP : ui::SCR_IDLE;
   if (want != screen) {
     screen = want;
     ui::enter(screen);
@@ -210,6 +237,8 @@ void loop() {
 
   if      (screen == ui::SCR_NAV)    ui::navFrame(model, h);
   else if (screen == ui::SCR_UPDATE) ui::updateFrame(ota::info(), h);
+  else if (screen == ui::SCR_SETUP)  ui::setupFrame(h);
+  else if (screen == ui::SCR_WAITSETUP) ui::waitSetupFrame(h);
   else                               ui::idleFrame(h);
 
   const int budget = (screen == ui::SCR_NAV) ? pxBudget : 0;   // 0 = unlimited

@@ -3,6 +3,8 @@
 #include <Update.h>
 #include <string.h>
 #include "battery.h"
+#include "language.h"
+#include <esp_heap_caps.h>
 
 namespace ota {
 namespace {
@@ -20,6 +22,25 @@ uint32_t lastRxMs_ = 0;
 uint32_t lastAckMs_ = 0;         // last OTA_ACK sent (any kind)
 uint32_t lastGapMs_ = 0;         // last GAP ack sent
 uint32_t stateMs_  = 0;          // when ERROR / DONE was entered
+
+// Update.begin() mallocs a 4 KB sector buffer and fails with "malloc failed" when the heap has no contiguous block that big.
+// Update.abort() frees that buffer, but the BLE stack / UI grab the hole before the next OTA_BEGIN. So keep a same-sized block
+// parked here: it is handed back right before Update.begin() (so Update's malloc takes the same hole) and taken again as soon
+// as the update is aborted / finished / failed.
+// The block is made BIGGER than 4 KB (slack): the BLE task can allocate between our free() and Update's malloc(), and a block of
+// exactly 4096 would then be left too small (seen: maxBlock=4084). With slack, Update's 4 KB still fits after such a bite.
+void*  reserve_ = nullptr;
+size_t reserveSz_ = 0;
+void reserveTake() {
+  if (reserve_) return;
+  static const size_t sizes[] = { 8192, 6144, 5120, 4608 };
+  for (size_t sz : sizes) {
+    reserve_ = malloc(sz);
+    if (reserve_) { reserveSz_ = sz; return; }
+  }
+  reserveSz_ = 0;
+}
+inline void reserveRelease() { if (reserve_) { free(reserve_); reserve_ = nullptr; } }
 
 // ms elapsed since `t`, clamped to 0. `now` is sampled at the top of loop() and the stamps below are taken with
 // millis() while ble.poll() runs, i.e. they can be NEWER than `now`: a plain `now - t` would wrap to ~4e9.
@@ -42,6 +63,7 @@ void sendAck(uint8_t status) {
 // Transfer failed: drop the partial image, show the error screen, tell the phone.
 void enterError(uint8_t err, bool notify) {
   Update.abort();
+  reserveTake();
   Serial.printf("OTA error %u at %u/%u\n", (unsigned)err, (unsigned)next_, (unsigned)size_);
   in.state = OTA_ERROR; in.err = err;
   stateMs_ = millis();
@@ -69,12 +91,18 @@ void doBegin(const uint8_t* p, size_t len, bool secure) {
   if (batt >= 0 && batt < OTA_MIN_BATT_PCT) { sendAck(OTA_E_BATTERY); return; }
 
   if (in.state == OTA_RECEIVING) { Update.abort(); in.state = OTA_IDLE; }   // phone restarted: start over
+  reserveTake();                                              // make sure the hole exists (no-op if already held)
 
   static const char* DIGITS = "0123456789abcdef";             // (not HEX: Arduino defines that as a macro)
   for (int i = 0; i < 16; i++) { md5hex_[2 * i] = DIGITS[p[4 + i] >> 4]; md5hex_[2 * i + 1] = DIGITS[p[4 + i] & 15]; }
   md5hex_[32] = 0;
 
+  const size_t held = reserveSz_ ? (reserve_ ? reserveSz_ : 0) : 0;
+  reserveRelease();                                           // Update.begin() mallocs its 4 KB buffer from this hole
   if (!Update.begin(size)) {                                  // fails if it does not fit / no OTA partition
+    Serial.printf("Update.begin failed (err %u) reserve=%u free=%u maxBlock=%u\n", (unsigned)Update.getError(), (unsigned)held,
+                  (unsigned)ESP.getFreeHeap(), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+    reserveTake();
     sendAck(Update.getError() == UPDATE_ERROR_NO_PARTITION ? OTA_E_FLASH : OTA_E_SIZE);
     return;
   }
@@ -126,7 +154,7 @@ void doEnd() {
 
 // ---- OTA_ABORT (user cancelled in the app) ------------------------------------------------------------
 void doAbort() {
-  if (in.state == OTA_RECEIVING || in.state == OTA_VERIFYING) Update.abort();
+  if (in.state == OTA_RECEIVING || in.state == OTA_VERIFYING) { Update.abort(); reserveTake(); }
   if (in.state != OTA_DONE) { in.state = OTA_IDLE; in.err = OTA_OK; }
   sendAck(OTA_E_ABORTED);
 }
@@ -134,6 +162,11 @@ void doAbort() {
 }  // namespace
 
 void setSender(SendFn fn) { sendFn = fn; }
+
+void reserveHeap() {
+  reserveTake();
+  Serial.printf("OTA reserve: %u bytes, maxBlock=%u\n", (unsigned)(reserve_ ? reserveSz_ : 0), (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+}
 
 // main calls this every frame while it is holding the RX queue: the transfer is alive, just paused on our side.
 void keepAlive() { if (in.state == OTA_RECEIVING) lastRxMs_ = millis(); }
@@ -153,6 +186,7 @@ void onDisconnect() {
 }
 
 void update(uint32_t now) {
+  if (!reserve_ && in.state == OTA_IDLE) reserveTake();       // missed earlier (heap was too fragmented then): retry while idle
   switch (in.state) {
     case OTA_RECEIVING:
       if (since(now, lastRxMs_) > OTA_IDLE_TIMEOUT_MS) enterError(OTA_E_TIMEOUT, true);
@@ -176,18 +210,18 @@ const Info& info()   { return in; }
 
 const char* errorText(uint8_t s) {
   switch (s) {
-    case OTA_E_STATE:      return "Device busy";
-    case OTA_E_SIZE:       return "Image too large";
-    case OTA_E_GAP:        return "Transfer out of sync";
-    case OTA_E_FLASH:      return "Flash write error";
-    case OTA_E_MD5:        return "Checksum mismatch";
-    case OTA_E_BATTERY:    return "Battery too low";
-    case OTA_E_TIMEOUT:    return "Phone stopped sending";
-    case OTA_E_ARGS:       return "Bad request";
-    case OTA_E_ABORTED:    return "Connection lost";
-    case OTA_E_NOT_SECURE: return "Pairing required";
-    case OTA_E_IMAGE:      return "Not a valid firmware image";
-    default:               return "Unknown error";
+    case OTA_E_STATE:      return lang::tr(lang::S_OTA_E_STATE);
+    case OTA_E_SIZE:       return lang::tr(lang::S_OTA_E_SIZE);
+    case OTA_E_GAP:        return lang::tr(lang::S_OTA_E_GAP);
+    case OTA_E_FLASH:      return lang::tr(lang::S_OTA_E_FLASH);
+    case OTA_E_MD5:        return lang::tr(lang::S_OTA_E_MD5);
+    case OTA_E_BATTERY:    return lang::tr(lang::S_OTA_E_BATTERY);
+    case OTA_E_TIMEOUT:    return lang::tr(lang::S_OTA_E_TIMEOUT);
+    case OTA_E_ARGS:       return lang::tr(lang::S_OTA_E_ARGS);
+    case OTA_E_ABORTED:    return lang::tr(lang::S_OTA_E_ABORTED);
+    case OTA_E_NOT_SECURE: return lang::tr(lang::S_OTA_E_NOT_SECURE);
+    case OTA_E_IMAGE:      return lang::tr(lang::S_OTA_E_IMAGE);
+    default:               return lang::tr(lang::S_OTA_E_UNKNOWN);
   }
 }
 

@@ -233,4 +233,6 @@
  .pio/libdeps/nodemcu-32s/TFT_eSPI/Extensions/Sprite.h \
  src/MonoTileRenderer.h src/config.h src/battery.h src/nav_model.h \
  src/route_ring.h src/protocol.h src/pose_filter.h src/ble_nav.h \
- src/ota.h src/ui.h
+ src/ota.h src/ui.h src/device_config.h \
+ C:/Users/Tahiel/.platformio/packages/framework-arduinoespressif32/libraries/Preferences/src/Preferences.h \
+ src/language.h src/startup.h

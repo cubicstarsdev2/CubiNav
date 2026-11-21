@@ -84,4 +84,34 @@ inline void decode(const uint8_t* rle, int srcW, int srcH, int scale, uint8_t* o
   }
 }
 
+// Like decode(), but to any output size outW x outH (outW a multiple of 8, outW >= srcW, outH >= srcH): nearest neighbour, so a
+// non-integer ratio (64 -> 112 = x1.75) repeats some source pixels twice and others once. The dither is applied at the OUTPUT
+// resolution, exactly as in decode(). out: (outW/8) bytes per row, outH rows. srcW <= 256.
+inline void decodeSized(const uint8_t* rle, int srcW, int srcH, int outW, int outH, uint8_t* out) {
+  if (!srOk) buildSR();
+  const int stride = outW / 8;
+  uint8_t line[256];
+  uint8_t lvl = 0;
+  int left = 0, have = -1;                          // `have` = last source row decoded into `line`
+  for (int dy = 0; dy < outH; dy++) {
+    const int sy = dy * srcH / outH;
+    while (have < sy) {                             // runs are row-major, so source rows must be read in order
+      for (int sx = 0; sx < srcW; sx++) {
+        if (!left) { uint8_t b = pgm_read_byte(rle++); lvl = b >> 4; left = (b & 15) + 1; }
+        line[sx] = lvl;
+        left--;
+      }
+      have++;
+    }
+    uint8_t* row = out + dy * stride;
+    const int y = (dy / DS) & (DN - 1);
+    const int srY = SR[y];
+    memset(row, 0, stride);
+    for (int dx = 0; dx < outW; dx++) {
+      const int th = (SR[((dx / DS) & (DN - 1)) ^ y] << 1) | srY;
+      if (line[dx * srcW / outW] * DN2 > th * 15 + 7) row[dx >> 3] |= (uint8_t)(0x80 >> (dx & 7));
+    }
+  }
+}
+
 }  // namespace bootalpha

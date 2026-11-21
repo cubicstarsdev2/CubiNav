@@ -3,12 +3,16 @@
 // a solid black turn banner, a thin status bar, 2 px rules and tracked small caps.
 // Everything goes through MonoTileRenderer: text/icons are 1-bpp sprites blitted as bitmaps.
 #include "ui.h"
+#include "language.h"
 #include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 #include "config.h"
 #include "tv_fonts.h"
+#include "tv_fonts_setup.h"   // BN24: full-ASCII bold for the device name
+#include "device_name.h"
+#include "qr_app.h"
 
 // Optional boot animation: put boot_frames.h (from png2frames.py) next to the sources to enable it.
 #if defined(__has_include)
@@ -28,6 +32,66 @@
 #endif
 #ifndef BOOT_ANIM_SCALE
 #define BOOT_ANIM_SCALE ((SCREEN_H - 32) / BOOT_FRAME_H)   // auto: largest integer scale with a 16 px margin (64 px -> x4, 128 px -> x2 = 256 px)
+#endif
+
+// Optional mascot for the "continue your setup" screen: setup_mascot_start.h (plays once) + setup_mascot_loop.h (then repeats), both
+// made by png2frames.py --format alpha4 (64x64, 24 fps). Without them the screen shows the static app icon instead.
+// Both files define the same names as boot_frames.h (BOOT_FRAME_*, BOOT_ALPHA_*): each one is included under its own array names,
+// its constants are copied into setupmascot::, and the BOOT_* macros are put back as they were (push_macro / pop_macro), so the
+// boot animation is not affected.
+#if defined(__has_include)
+  #if __has_include("setup_mascot_start.h") && __has_include("setup_mascot_loop.h")
+    #define HAVE_SETUP_MASCOT 1
+  #endif
+#endif
+#ifndef HAVE_SETUP_MASCOT
+#define HAVE_SETUP_MASCOT 0
+#endif
+#if HAVE_SETUP_MASCOT
+  #include "boot_alpha.h"
+  #pragma push_macro("BOOT_FRAME_FORMAT")
+  #pragma push_macro("BOOT_FRAME_W")
+  #pragma push_macro("BOOT_FRAME_H")
+  #pragma push_macro("BOOT_FRAME_COUNT")
+  #pragma push_macro("BOOT_FRAME_FPS")
+  #pragma push_macro("BOOT_ALPHA_OFFSETS")
+  #pragma push_macro("BOOT_ALPHA_DATA")
+  #undef BOOT_FRAME_FORMAT
+  #undef BOOT_FRAME_W
+  #undef BOOT_FRAME_H
+  #undef BOOT_FRAME_COUNT
+  #undef BOOT_FRAME_FPS
+  #define BOOT_ALPHA_OFFSETS MASCOT_START_OFFSETS
+  #define BOOT_ALPHA_DATA    MASCOT_START_DATA
+  #include "setup_mascot_start.h"
+  namespace setupmascot { constexpr int SRC = BOOT_FRAME_W, START_N = BOOT_FRAME_COUNT, START_FPS = BOOT_FRAME_FPS; }
+  static_assert(BOOT_FRAME_W == BOOT_FRAME_H && BOOT_FRAME_W <= 256, "setup mascot frames must be square, at most 256 px");
+  #undef BOOT_FRAME_FORMAT
+  #undef BOOT_FRAME_W
+  #undef BOOT_FRAME_H
+  #undef BOOT_FRAME_COUNT
+  #undef BOOT_FRAME_FPS
+  #undef BOOT_ALPHA_OFFSETS
+  #undef BOOT_ALPHA_DATA
+  #define BOOT_ALPHA_OFFSETS MASCOT_LOOP_OFFSETS
+  #define BOOT_ALPHA_DATA    MASCOT_LOOP_DATA
+  #include "setup_mascot_loop.h"
+  namespace setupmascot { constexpr int LOOP_N = BOOT_FRAME_COUNT, LOOP_FPS = BOOT_FRAME_FPS; }
+  static_assert(BOOT_FRAME_W == setupmascot::SRC && BOOT_FRAME_H == setupmascot::SRC, "start and loop mascot frames must have the same size");
+  #undef BOOT_FRAME_FORMAT
+  #undef BOOT_FRAME_W
+  #undef BOOT_FRAME_H
+  #undef BOOT_FRAME_COUNT
+  #undef BOOT_FRAME_FPS
+  #undef BOOT_ALPHA_OFFSETS
+  #undef BOOT_ALPHA_DATA
+  #pragma pop_macro("BOOT_FRAME_FORMAT")
+  #pragma pop_macro("BOOT_FRAME_W")
+  #pragma pop_macro("BOOT_FRAME_H")
+  #pragma pop_macro("BOOT_FRAME_COUNT")
+  #pragma pop_macro("BOOT_FRAME_FPS")
+  #pragma pop_macro("BOOT_ALPHA_OFFSETS")
+  #pragma pop_macro("BOOT_ALPHA_DATA")
 #endif
 
 using namespace mtr;
@@ -85,6 +149,12 @@ Renderer* R   = nullptr;
 #define UI_REVEAL_SPEED_DIV 2.0f
 #endif
 static_assert(UI_REVEAL_SPEED_DIV > 0, "UI_REVEAL_SPEED_DIV must be > 0");
+// Shutdown transition: current screen -> blank screen, right before a restart (see shutdownTransition()). Same interlock effect as the
+// reveal, own speed: 1.0 = designed speed (0.52 s). It delays the restart by that long.
+#ifndef UI_SHUTDOWN_SPEED_DIV
+#define UI_SHUTDOWN_SPEED_DIV 1.0f
+#endif
+static_assert(UI_SHUTDOWN_SPEED_DIV > 0, "UI_SHUTDOWN_SPEED_DIV must be > 0");
 const uint32_t REVEAL_MS  = 520;       // screen change: interlock reveal, at designed speed
 const int      IL_COLS    = 12;        // interlock: columns (SCREEN_W / 12 = 40 px)
 const float    IL_STAGGER = .03f;      // ...each one starts this fraction of REVEAL_MS after the previous one (30 ms at designed speed)
@@ -112,7 +182,7 @@ const uint32_t PT_FLASH_STEP_MS = 90;
 #ifndef UI_OTA_CANCEL_TRANSITION
 #define UI_OTA_CANCEL_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
-// Update -> "Update failed" and "Update failed" -> idle (see "Update failed" below). 0 = hard cut / plain curtain wipe.
+// Update -> lang::tr(lang::S_UPD_FAILED) and "Update failed" -> idle (see "Update failed" below). 0 = hard cut / plain curtain wipe.
 #ifndef UI_OTA_FAIL_TRANSITION
 #define UI_OTA_FAIL_TRANSITION 0   // off by default: this screen change is the interlock reveal (1 = bespoke transition)
 #endif
@@ -183,10 +253,10 @@ uint32_t revealStart   = 0;
 // That only works if nothing is drawn INTO the not-yet-reached part, so the leading edge sits on the new screen's side of the line (the
 // HTML draws it on the old side). A finished column is left alone.
 // Cost: at most one ovRestore for the columns not started, plus an ovRestore and an edge per moving column (2 * IL_COLS + 1 commands).
-void emitReveal(uint32_t now) {
+void emitReveal(uint32_t now, float div = (float)UI_REVEAL_SPEED_DIV) {
 #if UI_ANIMATIONS
   if (revealPending) { revealPending = false; revealStart = now; }
-  const uint32_t el = trElapsed(now, revealStart, (float)UI_REVEAL_SPEED_DIV);
+  const uint32_t el = trElapsed(now, revealStart, div);
   if (el >= REVEAL_MS) return;
   const float t = (float)el / (float)REVEAL_MS;
   const int   cw = SCREEN_W / IL_COLS;                                         // column width
@@ -250,6 +320,8 @@ TextSpr tPTitle, tPTag, tPLbl, tPDig, tPH1, tPH2;            // pairing
 TextSpr tBatt, tBtLbl, tVerLbl, tFps;                        // status bar
 TextSpr tDist, tStreet, tBig, tSpeed, tUnit, tDir, tPill, tLimit;    // navigation
 TextSpr tUpLbl, tUpPct, tUpKB, tUpVer, tUpHint, tFailT, tFailE, tFailH;   // firmware update
+TextSpr tWA1, tWA2, tWA3;                                       // "continue your setup": headline line 1 / 2, "on the ... app" line
+TextSpr tSTag, tSL1, tSL2, tSL3, tSN1, tSN2, tSN3, tSH1, tSH2, tName;      // setup
 
 TFT_eSprite* spLogoBig = nullptr;
 TFT_eSprite* spLogoSmall = nullptr;
@@ -261,6 +333,11 @@ TFT_eSprite* spCheck = nullptr;      // white disc with check (arrived)
 TFT_eSprite* spDash = nullptr;       // dashed accuracy ring (no GPS)
 TFT_eSprite* spHatch = nullptr;      // hatched strip under the banner
 TFT_eSprite* spLock = nullptr;
+TFT_eSprite* spQr = nullptr;         // setup: QR code, QR_APP_N modules x 5 px
+TFT_eSprite* spAppIcon = nullptr;    // "continue your setup": app icon, rounded square with the kite knocked out
+#if HAVE_SETUP_MASCOT
+uint8_t*      maBuf = nullptr;       // "continue your setup": decoded + dithered mascot frame, 1 bpp
+#endif
 
 void mk(TextSpr& t, int x, int y, int w, int h) { mkSprite(t.sp, w, h); t.x = x; t.y = y; t.w = w; t.h = h; }
 void mkHalo(TextSpr& t) { mkSprite(t.halo, t.w, t.h); }
@@ -1091,9 +1168,8 @@ struct ViewKey { int32_t qx, qy, qh; uint32_t rev; uint16_t zoom; uint32_t dt; u
 ViewKey lastKey; bool keyValid = false;
 
 const char* cardinal(float h) {
-  static const char* N[8] = {"N", "NE", "E", "SE", "S", "SW", "W", "NW"};
   h = fmodf(h, 360.f); if (h < 0) h += 360.f;
-  return N[((int)((h + 22.5f) / 45.f)) & 7];
+  return lang::cardinal((int)((h + 22.5f) / 45.f));
 }
 
 // =============================================================================================
@@ -1212,8 +1288,8 @@ void buildIdleArt() {
 
   mk(tPinQ, 0, 0, 24, 26);                                   // "?" knocked out of the pin head (placed every frame)
   setText(tPinQ, "?", S19, AL_C, 20);
-  mk(tStartL, (int)lroundf(trParkX) - 30, (int)lroundf(trParkY) + 32, 60, 16);
-  setText(tStartL, "START", FB11, AL_C, 12, 2);
+  mk(tStartL, (int)lroundf(trParkX) - 40, (int)lroundf(trParkY) + 32, 80, 16);   // 80 wide: "INICIO" is longer than "START"
+  setText(tStartL, lang::tr(lang::S_START), FB11, AL_C, 12, 2);
 }
 
 // Marker = black disc with a white arrow pointing along the road (the logo's kite).
@@ -1405,8 +1481,8 @@ bool idleLostText(const Hud& h) {
 void idleTexts(const Hud& h) {
   char stat[48];
   if (!h.connected && idleLostText(h)) {                     // just dropped: say so for a moment (see "Idle: the trail")
-    setText(tStat, "DISCONNECTED", B12, AL_C, 17, 2);
-    setText(tHint, "Connection to phone lost.", S17, AL_L, 18);
+    setText(tStat, lang::tr(lang::S_DISCONNECTED), B12, AL_C, 17, 2);
+    setText(tHint, lang::tr(lang::S_CONN_LOST), S17, AL_L, 18);
   } else if (!h.connected) {
     static const char* DOTS[4] = {"", ".", "..", "..."};
 #if UI_ANIMATIONS
@@ -1414,16 +1490,17 @@ void idleTexts(const Hud& h) {
 #else
     const char* dots = DOTS[3];
 #endif
-    snprintf(stat, sizeof(stat), "SEARCHING%s", dots);
+    snprintf(stat, sizeof(stat), "%s%s", lang::tr(lang::S_SEARCHING), dots);
     if (begin(tStat, stat)) {                                // centred on the full text, so the dots do not shift it
-      int w = textW(B12, "SEARCHING...", 2);
+      char full[40]; snprintf(full, sizeof(full), "%s...", lang::tr(lang::S_SEARCHING));
+      int w = textW(B12, full, 2);
       put(tStat, B12, stat, (tStat.w - w) / 2, 17, 2);
       finish(tStat);
     }
-    setText(tHint, "Your next trip starts in the app.", S17, AL_L, 18);
+    setText(tHint, lang::tr(lang::S_NEXT_TRIP), S17, AL_L, 18);
   } else {
-    setText(tStat, "CONNECTED", B12, AL_C, 17, 2);
-    setText(tHint, "Pick a destination to start.", S17, AL_L, 18);
+    setText(tStat, lang::tr(lang::S_CONNECTED), B12, AL_C, 17, 2);
+    setText(tHint, lang::tr(lang::S_PICK_DEST), S17, AL_L, 18);
   }
 }
 
@@ -1455,8 +1532,8 @@ const int PDX[6] = {0, 60, 120, 196, 256, 316};              // digit boxes (52 
 const int PUX[6] = {56, 116, 176, 252, 312, 372};            // underline bars on screen
 
 void pairDraw(const char* code, float pt, bool inv, int x0, int x1) {
-  setText(tPH1, "Enter this code on your phone", S17, AL_C, 19);
-  setText(tPH2, "The code is new every time you connect.", M14, AL_C, 16);
+  setText(tPH1, lang::tr(lang::S_PAIR_H1), S17, AL_C, 19);
+  setText(tPH2, lang::tr(lang::S_PAIR_H2), M14, AL_C, 16);
 
   char chars[7]; int dy[6]; bool plain = true;               // plain: all six locked and still, so tPDig is drawn in one piece
   for (int i = 0; i < 6; i++) {
@@ -1747,7 +1824,7 @@ void upVerText(decltype(ota::Info::version) v) {
 // The firmware is told by main calling enter(SCR_IDLE) while a running update is on screen (no protocol change). The last
 // live update frame is remembered (up*) so the transition can start from exactly what the screen showed.
 //   0.00 - 0.30  drain: the bar drains right to left while the percent and the KB count fall in 50 ms steps;
-//                the hint changes to "Update cancelled." without the padlock
+//                the hint changes to lang::tr(lang::S_UPD_CANCELLED) without the padlock
 //   0.30 - 0.55  hold: nothing moves (costs no tiles, gives the message time to be read)
 //   0.55 - 1.15  sweep: one curtain bar, the one the pairing transition uses, left to right; the marker starts on the ruler line and lifts
 //                onto the road. Behind the bar the idle screen returns (road whole, status bar with the version)
@@ -1798,7 +1875,7 @@ void failDisc(int r) {                                       // black disc, whit
 
 void failTexts() {
   setText(tFailE, ota::errorText(upErr), S19, AL_C, 21);
-  setText(tFailH, "Old firmware kept. Try again in the app.", M14, AL_C, 14);
+  setText(tFailH, lang::tr(lang::S_FW_KEPT), M14, AL_C, 14);
 }
 
 // Update -> failed. The progress screen squeezes shut toward its centre line (40 ms apart), then the failure screen opens:
@@ -1825,7 +1902,7 @@ void failBuild(float ft) {
   if (shutInk(tUpKB, p(2), a, b)) blitClip(srcOf(tUpKB), a, b, M_SET);
   upVerText(upVer);
   if (shutInk(tUpVer, p(2), a, b)) blitClip(srcOf(tUpVer), a, b, M_SET);
-  const char* msg = "Keep the app open. Do not power off.";
+  const char* msg = lang::tr(lang::S_KEEP_OPEN);
   setText(tUpHint, msg, S14, AL_L, 16);
   const int total = 22 + textW(S14, msg, 0), x0 = (SCREEN_W - total) / 2;
   tUpHint.x = x0 + 22;
@@ -1893,7 +1970,7 @@ void cxDraw(const Hud& h, float tt) {
     upVerText(upVer);
     blitClip(srcOf(tUpVer), ix, SCREEN_W, M_SET);
 
-    const char* msg = "Update cancelled.";
+    const char* msg = lang::tr(lang::S_UPD_CANCELLED);
     setText(tUpHint, msg, S14, AL_L, 16);
     tUpHint.x = (SCREEN_W - textW(S14, msg, 0)) / 2;
     blitClip(srcOf(tUpHint), ix, SCREEN_W, M_SET);
@@ -2143,7 +2220,7 @@ void nvDraw(const Hud& h, float T, bool in) {
 
   // ---- idle scenery ----
   if (in || nvConn) { Hud hh = h; hh.connected = true; idleTexts(hh); }
-  else { setText(tStat, "DISCONNECTED", B12, AL_C, 17, 2); setText(tHint, "Connection to phone lost.", S17, AL_L, 18); }
+  else { setText(tStat, lang::tr(lang::S_DISCONNECTED), B12, AL_C, 17, 2); setText(tHint, lang::tr(lang::S_CONN_LOST), S17, AL_L, 18); }
   if (visWin(276, 332, sv(0), a, b)) blitClip(srcOf(spCloud, 276, 12, 56, 28), a, b, M_SET);
   if (visWin(86, 114, sv(1), a, b))  blitClip(srcOf(spTreeA, 86, 128, 28, 44), a, b, M_SET);
   if (visWin(233, 247, sv(2), a, b)) blitClip(srcOf(spXMark, 233, 125, 14, 14), a, b, M_SET);
@@ -2249,6 +2326,193 @@ void nvDraw(const Hud& h, float T, bool in) {
 // =============================================================================================
 // Boot
 // =============================================================================================
+// =============================================================================================
+// Setup screen (first boot: no phone bonded yet)
+// Left: step 1, a QR code that opens the app's download page. Right: step 2, the device name to pick in the app (black banner,
+// like the turn banner) and step 3, the pairing code that will appear on this screen. The rest of the setup runs on the phone.
+// Layout (480x320, status bar below y = 284):
+//   header      logo + CubiNav (same as pairing), tag SETUP
+//   x 30..190   [1] GET THE APP, QR 125 px (5 px modules) at (48, 98); 20 px clear around it, as a scanner wants
+//   x 213       dotted road between the columns
+//   x 232..460  [2] PICK THIS DEVICE, banner (232, 92, 228x52) with the name knocked out, hint; [3] ENTER THE CODE, hint
+// Everything static is drawn into BASE once (setupBuild); per frame there is only the pulse ring next to the name and the status bar.
+// =============================================================================================
+const int      SU_QR_X = 48, SU_QR_Y = 98, SU_QR_PX = 5;
+const int      SU_BAN_X = 232, SU_BAN_Y = 92, SU_BAN_W = 228, SU_BAN_H = 52;
+const int      SU_DOT_X = SU_BAN_X + 26, SU_DOT_Y = SU_BAN_Y + SU_BAN_H / 2;   // Bluetooth dot in the banner
+const uint32_t SU_PULSE_MS = 1600;     // ring around the dot: grows from r 7 to 20 in 90 % of this, then rests
+bool           suBuilt = false, waBuilt = false;
+
+// "Continue your setup" screen (paired, setup not finished). Layout from CubiNav_Continue_Setup_Screen.html (480x320):
+//   header   logo + CubiNav + tag SETUP (same as setup/pairing), 2 px rule at y 56 from x 20 to 460
+//   left     app icon: 112 px rounded square (radius 26) at (54, 115), 60 px kite knocked out of it.
+//            With setup_mascot_start.h / setup_mascot_loop.h present it is replaced by the dithered mascot animation (same box)
+//   right    x 194: headline in 2 lines (X36 bold, baselines y 147 and 185), then the app line (S19, baseline y 222)
+// All static: drawn into BASE once (waitBuild); per frame only the status bar.
+const int WA_ICON = 112, WA_ICON_X = 54, WA_ICON_Y = 115, WA_ICON_R = 26, WA_KITE = 60;
+#ifndef SETUP_MASCOT_SIZE
+#define SETUP_MASCOT_SIZE WA_ICON       // output size in px, multiple of 8. 112 = the icon box (64 px frames at x1.75); 128 = exact x2, centred on the same spot
+#endif
+const int WA_TX = 194, WA_TW = 272;                       // text column (ES line 2 is 262 px wide in X36)
+const int WA_H1_Y = 115, WA_H2_Y = 153, WA_H_H = 44, WA_H_BASE = 32;   // headline: sprites 38 px apart, baseline 32 px below the sprite top
+const int WA_L3_Y = 203, WA_L3_H = 28, WA_L3_BASE = 19;
+
+static void buildSetup() {
+  mkSprite(spQr, QR_APP_N * SU_QR_PX, QR_APP_N * SU_QR_PX);
+  if (uint8_t* p = rawBits(spQr)) {
+    const int w = QR_APP_N * SU_QR_PX;
+    for (int my = 0; my < QR_APP_N; my++)
+      for (int mx = 0; mx < QR_APP_N; mx++)
+        if ((QR_APP_ROWS[my] >> (QR_APP_N - 1 - mx)) & 1)
+          for (int dy = 0; dy < SU_QR_PX; dy++)
+            for (int dx = 0; dx < SU_QR_PX; dx++) setBit(p, w, w, mx * SU_QR_PX + dx, my * SU_QR_PX + dy);
+  }
+  mk(tSTag, 340, 22, 120, 14);
+  mk(tSN1, 30, 60, 22, 22);  mk(tSN2, 232, 60, 22, 22);  mk(tSN3, 232, 190, 22, 22);
+  mk(tSL1, 62, 60, 140, 22); mk(tSL2, 264, 60, 196, 22); mk(tSL3, 264, 190, 196, 22);
+  mk(tSH1, 232, 156, 228, 24);
+  mk(tSH2, 232, 220, 228, 20);
+  mk(tName, SU_BAN_X + 50, SU_BAN_Y, SU_BAN_W - 58, SU_BAN_H);
+  mk(tWA1, WA_TX, WA_H1_Y, WA_TW, WA_H_H); mk(tWA2, WA_TX, WA_H2_Y, WA_TW, WA_H_H); mk(tWA3, WA_TX, WA_L3_Y, WA_TW, WA_L3_H);
+#if HAVE_SETUP_MASCOT
+  maBuf = (uint8_t*)malloc(SETUP_MASCOT_SIZE / 8 * SETUP_MASCOT_SIZE);   // 1.5 KB at 112 px; if it fails the mascot is simply not drawn
+#else
+  mkSprite(spAppIcon, WA_ICON, WA_ICON);                         // same kite as buildLogo(), on a rounded square
+  spAppIcon->fillRoundRect(0, 0, WA_ICON, WA_ICON, WA_ICON_R, 1);
+  {
+    const float k = WA_KITE / 24.f;                              // kite drawn in a 24 x 24 box: (12,2) (21,21) (12,16.5) (3,21)
+    const float o = (WA_ICON - WA_KITE) / 2.f;
+    auto P = [&](float x, float y, int& ox, int& oy) { ox = lroundf(o + x * k); oy = lroundf(o + y * k); };
+    int ax, ay, bx, by, cx, cy, dx, dy;
+    P(12, 2, ax, ay); P(21, 21, bx, by); P(12, 16.5f, cx, cy); P(3, 21, dx, dy);
+    spAppIcon->fillTriangle(ax, ay, bx, by, cx, cy, 0);
+    spAppIcon->fillTriangle(ax, ay, cx, cy, dx, dy, 0);
+  }
+#endif
+  setText(tSTag, lang::tr(lang::S_SU_TAG), FB11, AL_R, 11, 2, 2);
+  setText(tSN1, "1", B14, AL_C, 16);
+  setText(tSN2, "2", B14, AL_C, 16);
+  setText(tSN3, "3", B14, AL_C, 16);
+  setText(tSL1, lang::tr(lang::S_SU_L1), B12, AL_L, 15, 2);
+  setText(tSL2, lang::tr(lang::S_SU_L2), B12, AL_L, 15, 2);
+  setText(tSL3, lang::tr(lang::S_SU_L3), B12, AL_L, 15, 2);
+  setFit(tSH1, lang::tr(lang::S_SU_H1), S17, M15, 18);
+  setFit(tSH2, lang::tr(lang::S_SU_H2), M15, M14, 16);
+  setText(tName, devname::get(), BN24, AL_L, 35);                // "CubiNav-A4F2": see device_name.h
+}
+
+static inline void baseSpr(const TextSpr& t, Mode m) { R->baseBitmap(t.x, t.y, t.w, t.h, ptr(t.sp), m); }
+
+static void setupBuild() {
+  R->baseBitmap(20, 16, LOGO_SMALL, LOGO_SMALL, ptr(spLogoSmall), M_SET);
+  baseSpr(tPTitle, M_SET);
+  baseSpr(tSTag, M_SET);
+  const TextSpr* num[3] = {&tSN1, &tSN2, &tSN3};
+  const TextSpr* lbl[3] = {&tSL1, &tSL2, &tSL3};
+  for (int i = 0; i < 3; i++) {                                  // numbered black discs with the digit knocked out
+    R->baseFillCircle(num[i]->x + 11, num[i]->y + 11, 11, M_SET);
+    baseSpr(*num[i], M_CLR);
+    baseSpr(*lbl[i], M_SET);
+  }
+  R->baseBitmap(SU_QR_X, SU_QR_Y, QR_APP_N * SU_QR_PX, QR_APP_N * SU_QR_PX, ptr(spQr), M_SET);
+  for (int k = 0; k < 16; k++) R->baseFillCircle(213, 68 + 12 * k, 2, M_SET);   // the road between the columns
+  R->baseFillRect(SU_BAN_X, SU_BAN_Y, SU_BAN_W, SU_BAN_H, M_SET);
+  R->baseFillCircle(SU_DOT_X, SU_DOT_Y, 5, M_CLR);               // Bluetooth dot, knocked out of the banner
+  baseSpr(tName, M_CLR);
+  baseSpr(tSH1, M_SET);
+  baseSpr(tSH2, M_SET);
+}
+
+#if HAVE_SETUP_MASCOT
+// ---- Mascot player. Frames are decoded + dithered into maBuf and drawn into BASE; the renderer diffs against the panel, so only
+// the pixels that changed go over SPI. Plays "start" once, then "loop" forever. The last start frame and the last loop frame are
+// both identical to the first loop frame, so after start the loop continues at frame 1 and wraps from its last frame to frame 1.
+static_assert(SETUP_MASCOT_SIZE % 8 == 0 && SETUP_MASCOT_SIZE >= setupmascot::SRC, "SETUP_MASCOT_SIZE: multiple of 8, not smaller than the 64 px frames");
+const int MA_S = SETUP_MASCOT_SIZE;
+const int MA_X = WA_ICON_X + (WA_ICON - MA_S) / 2, MA_Y = WA_ICON_Y + (WA_ICON - MA_S) / 2;   // centred on the icon box
+uint8_t   maPhase = 0;                  // 0 = start, 1 = loop
+int       maFrame = -1;                 // frame on screen, -1 = none yet
+uint32_t  maNext = 0;                   // when the next frame is due; 0 = clock not started
+
+static void maDraw(uint8_t phase, int f) {
+  if (!maBuf) return;
+  const uint8_t* rle = phase == 0 ? MASCOT_START_DATA + pgm_read_dword(&MASCOT_START_OFFSETS[f])
+                                  : MASCOT_LOOP_DATA  + pgm_read_dword(&MASCOT_LOOP_OFFSETS[f]);
+  bootalpha::decodeSized(rle, setupmascot::SRC, setupmascot::SRC, MA_S, MA_S, maBuf);
+  R->baseFillRect(MA_X, MA_Y, MA_S, MA_S, M_CLR);                // frames are transparent: clear, then SET
+  R->baseBitmap(MA_X, MA_Y, MA_S, MA_S, maBuf, M_SET);
+  maPhase = phase; maFrame = f;
+}
+static void maReset() {                 // BASE was just cleared (enter()): show the first frame again
+  maNext = 0;
+#if UI_ANIMATIONS
+  maDraw(0, 0);                         // start frame 0 is empty: the mascot appears once the screen reveal is over
+#else
+  maDraw(1, 1);                         // no animations: a still pose (same picture as the end of "start")
+#endif
+}
+static void maTick(uint32_t now) {
+  const uint32_t per = 1000u / (maPhase == 0 ? setupmascot::START_FPS : setupmascot::LOOP_FPS);
+  if (!maNext) { maNext = now ? now : 1; return; }
+  if (now - maNext < per) return;
+  uint8_t ph = maPhase;
+  int f = maFrame + 1;
+  if (ph == 0 && f >= setupmascot::START_N) { ph = 1; f = 1; }
+  else if (ph == 1 && f >= setupmascot::LOOP_N) f = 1;
+  maDraw(ph, f);
+  maNext = (now - maNext >= 2 * per) ? now : maNext + per;       // after a stall resume at normal speed, no burst
+}
+#endif
+
+static void waitBuild() {
+  R->baseBitmap(20, 16, LOGO_SMALL, LOGO_SMALL, ptr(spLogoSmall), M_SET);
+  baseSpr(tPTitle, M_SET);
+  baseSpr(tSTag, M_SET);
+  R->baseFillRect(20, 56, 440, 2, M_SET);                        // header rule
+#if HAVE_SETUP_MASCOT
+  maReset();
+#else
+  R->baseBitmap(WA_ICON_X, WA_ICON_Y, WA_ICON, WA_ICON, ptr(spAppIcon), M_SET);
+#endif
+  setText(tWA1, lang::tr(lang::S_SETUP_L1), X36, AL_L, WA_H_BASE, -1);     // X36: full-ASCII bold, so every language works
+  setText(tWA2, lang::tr(lang::S_SETUP_L2), X36, AL_L, WA_H_BASE, -1);
+  setText(tWA3, lang::tr(lang::S_SETUP_WAIT), S19, AL_L, WA_L3_BASE);      // S_SETUP_WAIT now holds "on the CubiNav Connect app"
+  baseSpr(tWA1, M_SET); baseSpr(tWA2, M_SET); baseSpr(tWA3, M_SET);
+}
+
+void waitSetupFrame(const Hud& h) {
+  R->overlayBegin();
+  clipBegin();
+  if (!waBuilt) { waBuilt = true; waitBuild(); }
+#if HAVE_SETUP_MASCOT && UI_ANIMATIONS
+  if (!transitionBusy(h.nowMs)) maTick(h.nowMs);                 // not during the reveal (same rule as the pulse ring on the setup screen)
+#endif
+  emitStatusBar(h, true);
+  emitFps(h, h.showFps, 140, 264, false);
+  emitReveal(h.nowMs);
+}
+
+void setupFrame(const Hud& h) {
+  const uint32_t now = h.nowMs;
+  R->overlayBegin();
+  clipBegin();
+  if (!suBuilt) { suBuilt = true; setupBuild(); }
+#if UI_ANIMATIONS
+  // Pulse ring (like the START ring on idle). Not during the reveal: ovRestore only works if nothing is drawn into the old screen.
+  if (!transitionBusy(now)) {
+    const float p = (now % SU_PULSE_MS) / (float)SU_PULSE_MS;
+    if (p < 0.9f) {
+      const int r = 7 + (int)lroundf(13.f * easeOut(p / 0.9f));
+      R->ovCircle(SU_DOT_X, SU_DOT_Y, r, M_CLR);
+      R->ovCircle(SU_DOT_X, SU_DOT_Y, r - 1, M_CLR);
+    }
+  }
+#endif
+  emitStatusBar(h, true);
+  emitFps(h, h.showFps, 140, 264, false);
+  emitReveal(now);
+}
+
 void initBoot(TFT_eSPI* t, Renderer* r) {
   tft = t; R = r;
   buildLogo(spLogoBig, LOGO_BIG);
@@ -2338,8 +2602,8 @@ void initRest() {
   mk(tPH1, 0, 206, SCREEN_W, 24);
   mk(tPH2, 0, 234, SCREEN_W, 20);
   setText(tPTitle, "CubiNav", B17, AL_L, 19);
-  setText(tPTag, "PAIRING", FB11, AL_R, 11, 2, 2);
-  setText(tPLbl, "PAIRING CODE", B12, AL_C, 14, 2);
+  setText(tPTag, lang::tr(lang::S_PAIR_TAG), FB11, AL_R, 11, 2, 2);
+  setText(tPLbl, lang::tr(lang::S_PAIR_LABEL), B12, AL_C, 14, 2);
   // status bar
   mk(tBatt, 62, BOT_Y + 7, 56, 22);
   mk(tBtLbl, 0, BOT_Y + 9, 100, 16);
@@ -2354,7 +2618,7 @@ void initRest() {
   mk(tDir, 0, 293, 36, 16);
   mk(tPill, 0, 100, 160, 18);
   mk(tLimit, 0, 0, 64, 30);                                  // speed limit sign text
-  setText(tPill, "NO GPS SIGNAL", FB11, AL_L, 14, 2);
+  setText(tPill, lang::tr(lang::S_NO_GPS), FB11, AL_L, 14, 2);
   // firmware update
   mk(tUpLbl, 0, 20, SCREEN_W, 20);
   mk(tUpPct, 60, 52, 360, 88);
@@ -2364,10 +2628,19 @@ void initRest() {
   mk(tFailT, 0, 146, SCREEN_W, 44);
   mk(tFailE, 0, 196, SCREEN_W, 26);
   mk(tFailH, 0, 232, SCREEN_W, 20);
-  setText(tUpLbl, "FIRMWARE UPDATE", B12, AL_C, 14, 2);
-  setText(tFailT, "Update failed", X36, AL_C, 33, -1);
+  setText(tUpLbl, lang::tr(lang::S_FW_UPDATE), B12, AL_C, 14, 2);
+  setText(tFailT, lang::tr(lang::S_UPD_FAILED), X36, AL_C, 33, -1);
   buildIcons();
   buildMisc();
+  buildSetup();
+}
+
+// Boot is over: give the 8 KB animation buffer back. Left allocated, it fragments the heap and the firmware update (Update.begin needs a
+// contiguous block) fails with "malloc failed".
+void bootEnd() {
+#if HAVE_BOOT_ANIM
+  free(baBuf); baBuf = nullptr;
+#endif
 }
 
 void bootDraw() {
@@ -2449,12 +2722,35 @@ void enter(Screen s) {
   upLive = upShown = upSteady = upFailed = false;
   ipFresh = true;                                           // idle: no transition replay when the screen is (re)entered
   ptFresh = true; ptMode = PTR_NONE;                         // same for the idle <-> pairing transition
+  suBuilt = false; waBuilt = false;                                           // setup: BASE is rebuilt on the first frame
   revealPending = !otActive && !cxActive && !nvActive;       // the OTA, cancel and nav transitions replace the interlock reveal
   if (s == SCR_UPDATE && !otActive) updateRuler();           // static ruler under the progress bar
 }
 
 bool transitionBusy(uint32_t nowMs) {
   return otActive || cxActive || nvActive || revealPending || trElapsed(nowMs, revealStart, (float)UI_REVEAL_SPEED_DIV) < REVEAL_MS;
+}
+
+// Current screen -> blank, blocking (about 0.5 s). Call right before a restart. BASE is cleared (the blank screen) and the interlock
+// reveal runs over it: the part it has not reached yet keeps showing what is on the panel (ovRestore), so no screen content is needed.
+// Only from the task that owns the renderer (loop()). Runs once.
+void shutdownTransition() {
+#if UI_ANIMATIONS
+  static bool done = false;
+  if (done || !R) return;
+  done = true;
+  R->baseClear(M_CLR);
+  revealPending = true;                                      // emitReveal() starts the clock on its first call
+  const float div = (float)UI_SHUTDOWN_SPEED_DIV;
+  for (;;) {
+    const uint32_t now = millis();
+    R->overlayBegin();
+    emitReveal(now, div);
+    R->flush();
+    if (trElapsed(now, revealStart, div) >= REVEAL_MS) break;   // this last frame was the blank screen
+    delay(5);
+  }
+#endif
 }
 
 // ---- Idle / pairing -------------------------------------------------------------------
@@ -2531,18 +2827,18 @@ void navFrame(NavModel& m, const Hud& h) {
     }
     finish(tDist);
   }
-  if (rerouting)    setText(tStreet, "Calculating a new route", S19, AL_L, 17);
+  if (rerouting)    setText(tStreet, lang::tr(lang::S_REROUTING), S19, AL_L, 17);
   else              setFit(tStreet, m.street, S19, M15, 17);
   if (rerouting) {
 #if UI_ANIMATIONS
     static const char* DOTS[4] = {"", ".", "..", "..."};
-    snprintf(key, sizeof(key), "Rerouting%s", DOTS[(now / 350) & 3]);
+    snprintf(key, sizeof(key), "%s%s", lang::tr(lang::S_REROUTE_BIG), lang::get() == lang::EN ? DOTS[(now / 350) & 3] : "");   // ES word is too wide for the dots
 #else
-    snprintf(key, sizeof(key), "Rerouting...");
+    snprintf(key, sizeof(key), "%s%s", lang::tr(lang::S_REROUTE_BIG), lang::get() == lang::EN ? "..." : "");
 #endif
     setText(tBig, key, B46, AL_L, 44, -1);
   } else if (arrived) {
-    setText(tBig, "Arrived", B56, AL_L, 50, -2);
+    setText(tBig, lang::tr(lang::S_ARRIVED), B56, AL_L, 50, -2);
   }
 
   float kmh = m.pose.speedMs() * (cfg.imperial ? 2.236936f : 3.6f);
@@ -2630,7 +2926,7 @@ void navFrame(NavModel& m, const Hud& h) {
   if (nogps) {
     R->ovBitmap(0, BAN_H, SCREEN_W, 30, ptr(spHatch), M_SET);
     R->ovFillRect(0, BAN_H + 28, SCREEN_W, 2, M_SET);
-    const int tw = textW(FB11, "NO GPS SIGNAL", 2) + 2;
+    const int tw = textW(FB11, lang::tr(lang::S_NO_GPS), 2) + 2;
     const int pw = tw + 36, px = (SCREEN_W - pw) / 2;
     fillRR(px, BAN_H + 3, pw, 22, 11, M_SET);
     fillRR(px + 2, BAN_H + 5, pw - 4, 18, 9, M_CLR);
@@ -2770,7 +3066,7 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     failBuild(ft);                                           // progress screen closes, failure screen opens
   } else if (err) {
     setText(tFailE, ota::errorText(o.err), S19, AL_C, 21);
-    setText(tFailH, "Old firmware kept. Try again in the app.", M14, AL_C, 14);
+    setText(tFailH, lang::tr(lang::S_FW_KEPT), M14, AL_C, 14);
     R->ovFillRect(49, 172, 382, 30, M_CLR);                  // hide the ruler
     R->ovFillCircle(240, 92, 36, M_SET);
     R->ovLine(228, 80, 252, 104, 7, M_CLR);
@@ -2821,7 +3117,7 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     setText(tUpVer, b, FB11, AL_R, 14, 2, 2);
     if (openWin(340, 100, (tt - 1.35f) / .2f, wa, wb)) blitClip(srcOf(tUpVer), wa, wb, M_SET);
 
-    const char* msg = done ? "Restarting..." : ver ? "Verifying..." : "Keep the app open. Do not power off.";
+    const char* msg = done ? lang::tr(lang::S_RESTARTING) : ver ? lang::tr(lang::S_VERIFYING) : lang::tr(lang::S_KEEP_OPEN);
     setText(tUpHint, msg, S14, AL_L, 16);
     const bool lock = !done && !ver;
     const int tw = textW(S14, msg, 0);
