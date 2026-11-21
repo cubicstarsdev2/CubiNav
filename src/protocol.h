@@ -20,21 +20,23 @@
 // (C++11 constexpr: single-expression recursive functions only.)
 namespace fwv {
 constexpr bool isDigit(char c) { return c >= '0' && c <= '9'; }
+constexpr bool isAlpha(char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); }
 constexpr int  num(const char* s, int i, int acc = 0) { return isDigit(s[i]) ? num(s, i + 1, acc * 10 + (s[i] - '0')) : acc; }
 constexpr int  skipDigits(const char* s, int i) { return isDigit(s[i]) ? skipDigits(s, i + 1) : i; }
 constexpr int  nextPart(const char* s, int i) { return s[i] == '.' ? i + 1 : (s[i] == 0 ? i : nextPart(s, i + 1)); }
 constexpr int  major(const char* s) { return num(s, 0); }
 constexpr int  minor(const char* s) { return num(s, nextPart(s, 0)); }
 constexpr int  patch(const char* s) { return num(s, nextPart(s, nextPart(s, 0))); }
-// exactly "<digits>.<digits>.<digits>"
+// "<digits>.<digits>.<digits>" optionally followed by letters (e.g. "1.0.0R", "1.2.3beta")
+constexpr bool allAlpha(const char* s, int i) { return s[i] == 0 ? true : (isAlpha(s[i]) && allAlpha(s, i + 1)); }
 constexpr int  dotAfterDigits(const char* s, int i) { return (isDigit(s[i]) && s[skipDigits(s, i)] == '.') ? skipDigits(s, i) + 1 : -1; }
-constexpr bool tail(const char* s, int i)  { return isDigit(s[i]) && s[skipDigits(s, i)] == 0; }
+constexpr bool tail(const char* s, int i)  { return isDigit(s[i]) && allAlpha(s, skipDigits(s, i)); }
 constexpr bool part3(const char* s, int i) { return i >= 0 && tail(s, i); }
 constexpr bool part2(const char* s, int i) { return i >= 0 && part3(s, dotAfterDigits(s, i)); }
 constexpr bool valid(const char* s)        { return part2(s, dotAfterDigits(s, 0)); }
 }  // namespace fwv
 
-static_assert(fwv::valid(FW_VERSION_STRING), "FW_VERSION_STRING must look like \"1.2.3\"");
+static_assert(fwv::valid(FW_VERSION_STRING), "FW_VERSION_STRING must look like \"1.2.3\" or \"1.2.3R\" (letters allowed after the last digit)");
 #define FW_VERSION_MAJOR (fwv::major(FW_VERSION_STRING))
 #define FW_VERSION_MINOR (fwv::minor(FW_VERSION_STRING))
 #define FW_VERSION_PATCH (fwv::patch(FW_VERSION_STRING))
