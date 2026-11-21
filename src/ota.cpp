@@ -13,6 +13,7 @@ using namespace proto;
 
 SendFn   sendFn    = nullptr;
 Info     in;
+uint8_t  letter_   = 0;          // target version letter from OTA_BEGIN (optional trailing byte): 0 = none, 1 = A ... 26 = Z
 uint32_t size_     = 0;          // total image size
 uint32_t next_     = 0;          // next expected byte offset
 char     md5hex_[33] = {0};
@@ -74,7 +75,7 @@ uint8_t flashErr() {
   return Update.getError() == UPDATE_ERROR_MAGIC_BYTE ? OTA_E_IMAGE : OTA_E_FLASH;
 }
 
-// ---- OTA_BEGIN: size u32 | md5[16] | version u16 ---------------------------------------------------
+// ---- OTA_BEGIN: size u32 | md5[16] | version u16 | letter u8 (optional) ---------------------------------------------------
 void doBegin(const uint8_t* p, size_t len, bool secure) {
 #if BLE_REQUIRE_PAIRING
   if (!secure) { sendAck(OTA_E_NOT_SECURE); return; }
@@ -112,6 +113,7 @@ void doBegin(const uint8_t* p, size_t len, bool secure) {
   lastRxMs_ = millis();
   in.state = OTA_RECEIVING; in.err = OTA_OK;
   in.done = 0; in.total = size; in.version = rd16(p + 20);
+  letter_ = (len >= 23 && p[22] >= 1 && p[22] <= 26) ? p[22] : 0;   // older phones omit it
   sendAck(OTA_OK);                                            // carries window + ackEvery for the phone
 }
 
@@ -207,6 +209,7 @@ void update(uint32_t now) {
 
 bool        active() { return in.state != OTA_IDLE; }
 const Info& info()   { return in; }
+uint8_t     letter() { return letter_; }   // target version letter (0 = none); declared in ui.cpp, add it to ota.h if you prefer
 
 const char* errorText(uint8_t s) {
   switch (s) {

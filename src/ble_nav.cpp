@@ -196,11 +196,12 @@ void BleNav::send(const uint8_t* d, size_t n) {
 }
 
 void BleNav::sendHelloAck() {
-  uint8_t b[11];
+  uint8_t b[12];
   b[0] = HELLO_ACK; b[1] = PROTO_VERSION;
-  wrU16(b + 2, FW_VERSION); wrU16(b + 4, SCREEN_W); wrU16(b + 6, SCREEN_H); wrU16(b + 8, RouteRing::CAP);
-  BLOG("[ble] HELLO -> HELLO_ACK fw=0x%04X configured=%d", (unsigned)FW_VERSION, (int)configured_);
+  wrU16(b + 2, (uint16_t)(FW_VERSION & 0xFFFF)); wrU16(b + 4, SCREEN_W); wrU16(b + 6, SCREEN_H); wrU16(b + 8, RouteRing::CAP);   // bytes 2-3: major/minor/patch only (old apps read just this)
+  BLOG("[ble] HELLO -> HELLO_ACK fw=0x%06X configured=%d", (unsigned)FW_VERSION, (int)configured_);
   b[10] = configured_ ? 1 : 0;                          // optional byte 10 (FW 1.5.0+): 0 = first-time setup pending
+  b[11] = (uint8_t)FW_VERSION_LETTER;                   // optional byte 11: version letter, 0 = none, 1 = A ... 26 = Z (1.0.0R -> 18)
   send(b, sizeof(b));
 }
 

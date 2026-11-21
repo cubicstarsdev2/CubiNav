@@ -12,6 +12,7 @@
 #include "tv_fonts.h"
 #include "tv_fonts_setup.h"   // BN24: full-ASCII bold for the device name
 #include "device_name.h"
+namespace ota { uint8_t letter(); }   // ota.cpp: letter of the version being installed (0 = none, 1 = A ... 26 = Z)
 #include "qr_app.h"
 
 // Optional boot animation: put boot_frames.h (from png2frames.py) next to the sources to enable it.
@@ -333,7 +334,7 @@ TFT_eSprite* spCheck = nullptr;      // white disc with check (arrived)
 TFT_eSprite* spDash = nullptr;       // dashed accuracy ring (no GPS)
 TFT_eSprite* spHatch = nullptr;      // hatched strip under the banner
 TFT_eSprite* spLock = nullptr;
-TFT_eSprite* spQr = nullptr;         // setup: QR code, QR_APP_N modules x 5 px
+TFT_eSprite* spQr = nullptr;         // setup: QR code, QR_APP_N modules x SU_QR_PX px
 TFT_eSprite* spAppIcon = nullptr;    // "continue your setup": app icon, rounded square with the kite knocked out
 #if HAVE_SETUP_MASCOT
 uint8_t*      maBuf = nullptr;       // "continue your setup": decoded + dithered mascot frame, 1 bpp
@@ -1811,11 +1812,17 @@ void renderPct(const char* digits, bool withPct) {
 }
 
 // "FROM -> TO" under the progress bar.
-void upVerText(decltype(ota::Info::version) v) {
+// e.g. "1.0.0D -> 1.0.0R". The current side is FW_VERSION_STRING (letter included, like the boot screen), the target side is
+// major.minor.patch from OTA_BEGIN plus its optional letter.
+void fmtVerPair(char* b, size_t n, decltype(ota::Info::version) v, uint8_t letter) {
+  const char l[2] = { (letter >= 1 && letter <= 26) ? (char)('A' + letter - 1) : '\0', '\0' };
+  snprintf(b, n, "%s -> %u.%u.%u%s", FW_VERSION_STRING,
+           (unsigned)FW_V_MAJOR(v), (unsigned)FW_V_MINOR(v), (unsigned)FW_V_PATCH(v), l);
+}
+
+void upVerText(decltype(ota::Info::version) v, uint8_t letter) {
   char b[48];
-  snprintf(b, sizeof(b), "%u.%u.%u -> %u.%u.%u",
-           (unsigned)FW_V_MAJOR(FW_VERSION), (unsigned)FW_V_MINOR(FW_VERSION), (unsigned)FW_V_PATCH(FW_VERSION),
-           (unsigned)FW_V_MAJOR(v), (unsigned)FW_V_MINOR(v), (unsigned)FW_V_PATCH(v));
+  fmtVerPair(b, sizeof(b), v, letter);
   setText(tUpVer, b, FB11, AL_R, 14, 2, 2);
 }
 
@@ -1843,6 +1850,7 @@ int  upPct = 0;
 decltype(ota::Info::done)    upDone{};
 decltype(ota::Info::total)   upTotal{};
 decltype(ota::Info::version) upVer{};
+uint8_t upLetter = 0;
 uint8_t upErr = 0;
 bool upLive = false;                                         // the last update frame showed a running update (not verifying)
 bool upShown = false;                                        // ... showed the progress screen (running or verifying)
@@ -1900,7 +1908,7 @@ void failBuild(float ft) {
   snprintf(s, sizeof(s), "%lu / %lu KB", (unsigned long)((upDone + 512) / 1024), (unsigned long)((upTotal + 512) / 1024));
   setText(tUpKB, s, B14, AL_L, 16);
   if (shutInk(tUpKB, p(2), a, b)) blitClip(srcOf(tUpKB), a, b, M_SET);
-  upVerText(upVer);
+  upVerText(upVer, upLetter);
   if (shutInk(tUpVer, p(2), a, b)) blitClip(srcOf(tUpVer), a, b, M_SET);
   const char* msg = lang::tr(lang::S_KEEP_OPEN);
   setText(tUpHint, msg, S14, AL_L, 16);
@@ -1967,7 +1975,7 @@ void cxDraw(const Hud& h, float tt) {
     snprintf(b, sizeof(b), "%lu / %lu KB", (unsigned long)(((float)upDone * keep + 512.f) / 1024.f), (unsigned long)((upTotal + 512) / 1024));
     setText(tUpKB, b, B14, AL_L, 16);
     blitClip(srcOf(tUpKB), ix, SCREEN_W, M_SET);
-    upVerText(upVer);
+    upVerText(upVer, upLetter);
     blitClip(srcOf(tUpVer), ix, SCREEN_W, M_SET);
 
     const char* msg = lang::tr(lang::S_UPD_CANCELLED);
@@ -2332,12 +2340,14 @@ void nvDraw(const Hud& h, float T, bool in) {
 // like the turn banner) and step 3, the pairing code that will appear on this screen. The rest of the setup runs on the phone.
 // Layout (480x320, status bar below y = 284):
 //   header      logo + CubiNav (same as pairing), tag SETUP
-//   x 30..190   [1] GET THE APP, QR 125 px (5 px modules) at (48, 98); 20 px clear around it, as a scanner wants
+//   x 30..190   [1] GET THE APP, QR centred in the column at y 98: 5 px modules up to 29 modules (25 -> 125 px at x 48), 4 px modules
+//               above that (37 -> 148 px at x 36); the empty area around it is the quiet zone a scanner wants
 //   x 213       dotted road between the columns
 //   x 232..460  [2] PICK THIS DEVICE, banner (232, 92, 228x52) with the name knocked out, hint; [3] ENTER THE CODE, hint
 // Everything static is drawn into BASE once (setupBuild); per frame there is only the pulse ring next to the name and the status bar.
 // =============================================================================================
-const int      SU_QR_X = 48, SU_QR_Y = 98, SU_QR_PX = 5;
+const int      SU_QR_PX = (QR_APP_N <= 29) ? 5 : 4;               // module size in px: a bigger QR (version 4+) must shrink to fit the column
+const int      SU_QR_X = 110 - (QR_APP_N * SU_QR_PX) / 2, SU_QR_Y = 98;   // centred on the column (x 30..190)
 const int      SU_BAN_X = 232, SU_BAN_Y = 92, SU_BAN_W = 228, SU_BAN_H = 52;
 const int      SU_DOT_X = SU_BAN_X + 26, SU_DOT_Y = SU_BAN_Y + SU_BAN_H / 2;   // Bluetooth dot in the banner
 const uint32_t SU_PULSE_MS = 1600;     // ring around the dot: grows from r 7 to 20 in 90 % of this, then rests
@@ -3023,7 +3033,7 @@ void updateFrame(const ota::Info& o, const Hud& h) {
   int pct = o.total ? (int)(((uint64_t)o.done * 100) / o.total) : 0;
   if (done) pct = 100;
   if (pct > 100) pct = 100;
-  upPct = pct; upDone = o.done; upTotal = o.total; upVer = o.version;   // what a cancel transition starts from
+  upPct = pct; upDone = o.done; upTotal = o.total; upVer = o.version; upLetter = ota::letter();   // what a cancel transition starts from
   upLive = !err && !done && !ver;
   const bool prevShown = upShown && upSteady;               // the previous frame showed the complete progress screen
   upShown = !err && !done; upFailed = err;
@@ -3111,9 +3121,7 @@ void updateFrame(const ota::Info& o, const Hud& h) {
     snprintf(b, sizeof(b), "%lu / %lu KB", (unsigned long)((o.done + 512) / 1024), (unsigned long)((o.total + 512) / 1024));
     setText(tUpKB, b, B14, AL_L, 16);
     if (openWin(150, 110, (tt - 1.35f) / .2f, wa, wb)) blitClip(srcOf(tUpKB), wa, wb, M_SET);
-    snprintf(b, sizeof(b), "%u.%u.%u -> %u.%u.%u",
-             (unsigned)FW_V_MAJOR(FW_VERSION), (unsigned)FW_V_MINOR(FW_VERSION), (unsigned)FW_V_PATCH(FW_VERSION),
-             (unsigned)FW_V_MAJOR(o.version),  (unsigned)FW_V_MINOR(o.version),  (unsigned)FW_V_PATCH(o.version));
+    fmtVerPair(b, sizeof(b), o.version, ota::letter());
     setText(tUpVer, b, FB11, AL_R, 14, 2, 2);
     if (openWin(340, 100, (tt - 1.35f) / .2f, wa, wb)) blitClip(srcOf(tUpVer), wa, wb, M_SET);
 
